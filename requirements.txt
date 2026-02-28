@@ -1,0 +1,19 @@
+# Deep Agents 项目依赖
+
+# 核心依赖
+deepagents>=0.1.0
+langchain>=0.3.0
+langgraph>=0.2.0
+
+# LLM 提供商
+langchain-openai>=0.2.0
+langchain-daytona
+# SiliconFlow 兼容 (使用 OpenAI 兼容接口)
+openai>=1.0.0
+
+# Daytona 沙盒
+daytona-sdk>=0.148.0
+
+# 工具和实用程序
+python-dotenv>=1.0.0
+httpx>=0.27.0
