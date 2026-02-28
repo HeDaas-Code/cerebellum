@@ -8,7 +8,7 @@ config = CerebellumConfig(
 )
 
 with Cerebellum(config=config) as agent:
-    result = agent.run("生成一个斐波那契数列图片")
+    result = agent.run("获取北京气温数据，生成北京2026年3月一日天气分析图")
     
     # 访问返回的文件
     for file in result["files"]:

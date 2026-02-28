@@ -265,15 +265,7 @@ class Cerebellum:
             # 文档
             'pdf', 'doc', 'docx', 'txt', 'md', 'rtf', 'odt',
             # 表格
-            'csv', 'xlsx', 'xls', 'ods',
-            # 代码
-            'py', 'js', 'ts', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'rb', 'php', 'swift', 'kt',
-            # 数据
-            'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg',
-            # 压缩包
-            'zip', 'tar', 'gz', 'rar', '7z',
-            # 其他
-            'html', 'css', 'scss', 'sql', 'sh', 'bat', 'ps1'
+            'csv', 'xlsx', 'xls', 'ods'
         ]
         
         ext = filename.lower().split('.')[-1] if '.' in filename else ''
