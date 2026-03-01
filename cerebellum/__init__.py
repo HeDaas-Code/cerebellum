@@ -473,12 +473,17 @@ class Cerebellum:
         
         return self
     
-    def run(self, task: str) -> Dict[str, Any]:
+    def run(
+        self, 
+        task: str, 
+        files: Optional[List[tuple]] = None
+    ) -> Dict[str, Any]:
         """
         执行任务
         
         Args:
             task: 任务描述
+            files: 可选，要上传处理的文件列表 [(file_data, filename), ...]
         
         Returns:
             包含结果和文件信息的字典
@@ -488,7 +493,8 @@ class Cerebellum:
                 "files": [
                     {"name": "file.txt", "content": "文件内容", "type": "text"},
                     {"name": "image.png", "content": b"...", "type": "image/png"}
-                ]
+                ],
+                "uploaded_files": [...]  # 上传的文件信息（如果有）
             }
         """
         if self.agent is None:
@@ -498,8 +504,14 @@ class Cerebellum:
         result = {
             "success": False,
             "message": "",
-            "files": []
+            "files": [],
+            "uploaded_files": []
         }
+        
+        # 处理上传的文件
+        task_prompt = task
+        if files:
+            task_prompt = self._build_file_prompt(task, files, result)
         
         try:
             print("[正在处理...]")
@@ -508,7 +520,7 @@ class Cerebellum:
                     "messages": [
                         {
                             "role": "user",
-                            "content": task
+                            "content": task_prompt
                         }
                     ],
                     "files": self.skills_files
@@ -534,6 +546,47 @@ class Cerebellum:
         
         return result
     
+    def _build_file_prompt(
+        self, 
+        task: str, 
+        files: List[tuple],
+        result: Dict[str, Any]
+    ) -> str:
+        """构建包含上传文件的任务提示"""
+        from .upload import FileUploader
+        
+        uploader = FileUploader()
+        uploaded_info = []
+        
+        prompt = task + "\n\n"
+        prompt += "## 上传的文件\n\n"
+        
+        for file_data, filename in files:
+            upload_result = uploader.upload(file_data, filename)
+            
+            if upload_result.success:
+                file = upload_result.file
+                prompt += f"### 文件: {file.filename}\n"
+                prompt += f"- 大小: {file.size} bytes\n"
+                prompt += f"- 类型: {file.content_type}\n\n"
+                
+                if file.parsed and file.parsed.is_valid:
+                    prompt += f"内容:\n{file.parsed.text}\n\n"
+                else:
+                    prompt += "[文件内容无法自动解析]\n\n"
+                
+                uploaded_info.append({
+                    "filename": file.filename,
+                    "size": file.size,
+                    "content_type": file.content_type
+                })
+            else:
+                prompt += f"### 文件: {filename}\n"
+                prompt += f"[上传失败: {upload_result.error}]\n\n"
+        
+        result["uploaded_files"] = uploaded_info
+        return prompt
+    
     def __enter__(self):
         """上下文管理器入口"""
         return self.initialize()
@@ -545,7 +598,12 @@ class Cerebellum:
 
 
 
-def run_task(task: str, config: Optional[CerebellumConfig] = None, debug: bool = False) -> Dict[str, Any]:
+def run_task(
+    task: str, 
+    config: Optional[CerebellumConfig] = None, 
+    debug: bool = False,
+    files: Optional[List[tuple]] = None
+) -> Dict[str, Any]:
     """
     快速运行任务的便捷函数
     
@@ -553,9 +611,42 @@ def run_task(task: str, config: Optional[CerebellumConfig] = None, debug: bool =
         task: 任务描述
         config: 配置对象（可选）
         debug: 是否启用调试模式
+        files: 可选，要上传处理的文件列表 [(file_data, filename), ...]
     
     Returns:
         包含结果和文件信息的字典
     """
     with Cerebellum(config=config, debug=debug) as agent:
-        return agent.run(task)
+        return agent.run(task, files=files)
+
+
+# 导入扩展模块
+from .security import FileSecurityChecker, SecurityCheckResult, check_file
+from .parser import FileParserManager, ParsedContent, parse_file
+from .upload import FileUploader, UploadResult, UploadedFile, upload_file
+from .plus import CerebellumPlus, process_file, process_files
+
+__all__ = [
+    # 核心类
+    "Cerebellum",
+    "CerebellumConfig",
+    "FileData",
+    "run_task",
+    
+    # 文件处理
+    "FileSecurityChecker",
+    "SecurityCheckResult",
+    "check_file",
+    "FileParserManager", 
+    "ParsedContent",
+    "parse_file",
+    "FileUploader",
+    "UploadResult",
+    "UploadedFile",
+    "upload_file",
+    
+    # 增强版
+    "CerebellumPlus",
+    "process_file",
+    "process_files",
+]

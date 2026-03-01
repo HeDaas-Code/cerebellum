@@ -9,11 +9,15 @@
 - **技能系统** - 加载自定义技能处理特定任务
 - **联网搜索** - 支持 Tavily 搜索
 - **文件数据返回** - 直接返回文件内容（bytes/str），不保存到本地
+- **文件上传处理** - 支持上传文件并让 AI 分析处理
 
 ## 安装
 
 ```bash
 pip install -r requirements.txt
+
+# 可选依赖（用于文件解析）
+pip install pdfplumber python-docx pyyaml
 ```
 
 ## 快速开始
@@ -50,22 +54,48 @@ from cerebellum import run_task
 result = run_task("请帮我生成一个斐波那契数列的图片", debug=True)
 ```
 
-### 方式3: 配置对象
+### 方式3: 带文件上传的任务
 
 ```python
 from cerebellum import Cerebellum, CerebellumConfig
 
-config = CerebellumConfig(
-    dashscope_api_key="your_api_key",
-    dashscope_model="glm-5",
-    daytona_api_key="your_daytona_key",
-    tavily_api_key="your_tavily_key",
-    skills_dir=Path("./skills"),
+config = CerebellumConfig(debug=True)
+
+# 读取本地文件
+with open("document.pdf", "rb") as f:
+    file_data = f.read()
+
+# 上传文件并处理（files 参数可选）
+with Cerebellum(config=config) as agent:
+    result = agent.run(
+        task="请总结这份文档的主要内容",
+        files=[(file_data, "document.pdf")]  # 可选
+    )
+    
+    # result 包含:
+    # {
+    #     "success": True,
+    #     "message": "处理结果...",
+    #     "files": [...],        # 沙盒生成的文件
+    #     "uploaded_files": [...]  # 上传的文件信息
+    # }
+```
+
+### 方式4: 便捷函数 + 文件
+
+```python
+from cerebellum import run_task
+
+# 读取文件
+with open("report.pdf", "rb") as f:
+    pdf_data = f.read()
+
+# 带文件的任务
+result = run_task(
+    task="分析这份报告",
+    files=[(pdf_data, "report.pdf")],
     debug=True
 )
-
-with Cerebellum(config=config) as agent:
-    result = agent.run("帮我搜集关于明日方舟终末地的信息")
 ```
 
 ## API 参考
@@ -90,40 +120,35 @@ with Cerebellum(config=config) as agent:
 
 #### 方法
 
-##### `__init__(config: Optional[CerebellumConfig] = None, debug: bool = False)`
-
-初始化代理。
-
-##### `initialize() -> Cerebellum`
-
-手动初始化（创建 LLM、沙盒、Agent）。通常不需要手动调用，`run()` 会自动初始化。
-
-##### `run(task: str) -> Dict[str, Any]`
+##### `run(task: str, files: Optional[List[tuple]] = None) -> Dict[str, Any]`
 
 执行任务。
+
+**参数:**
+- `task: str` - 任务描述
+- `files: Optional[List[tuple]]` - 可选，上传的文件列表 [(file_data, filename), ...]
 
 **返回:**
 ```python
 {
     "success": bool,           # 是否成功
     "message": str,            # 处理结果文本
-    "files": [                 # 文件列表
+    "files": [                 # 沙盒生成的文件列表
         FileData(
             name="file.txt",   # 文件名
             content=b"...",    # 文件内容 (bytes 或 str)
             type="text/plain"  # 文件类型
         )
+    ],
+    "uploaded_files": [        # 上传的文件信息（如果有）
+        {"filename": "doc.pdf", "size": 1024, "content_type": "application/pdf"}
     ]
 }
 ```
 
-##### `__enter__() / __exit__()`
-
-上下文管理器支持。
-
 ### FileData
 
-文件数据类。
+文件数据类（沙盒下载的文件）。
 
 #### 属性
 
@@ -141,16 +166,83 @@ with Cerebellum(config=config) as agent:
 | `get_text()` | str | 获取文本内容 |
 | `get_base64()` | str | 获取 Base64 编码 |
 
-### run_task()
+### 文件上传和处理
 
-便捷函数，快速执行任务。
+#### FileUploader
+
+文件上传处理器。
 
 ```python
-def run_task(
-    task: str,
-    config: Optional[CerebellumConfig] = None,
-    debug: bool = False
-) -> Dict[str, Any]
+from cerebellum import FileUploader, upload_file
+
+uploader = FileUploader(
+    max_file_size=10 * 1024 * 1024,  # 10MB
+    parse=True,    # 自动解析
+    check_security=True  # 安全检查
+)
+
+result = uploader.upload(file_data, filename)
+
+if result.success:
+    file = result.file
+    print(f"文件名: {file.filename}")
+    print(f"解析内容: {file.text}")
+```
+
+#### FileSecurityChecker
+
+文件安全检查器。
+
+```python
+from cerebellum import FileSecurityChecker, check_file
+
+# 检查文件
+result = check_file(file_data, filename)
+
+if result.is_safe:
+    print("文件安全")
+else:
+    print(f"不安全: {result.error}")
+```
+
+#### FileParserManager
+
+文件解析管理器，支持格式：
+- 文本：txt, md, log, rst
+- 表格：csv, tsv
+- 文档：pdf, docx
+- 数据：json, xml, yaml
+- 图片：png, jpg, gif, bmp, webp, svg
+
+```python
+from cerebellum import parse_file
+
+result = parse_file(file_data, "document.pdf")
+
+if result.is_valid:
+    print(result.text)  # 提取的文本
+    print(result.metadata)  # 元数据
+```
+
+#### CerebellumPlus
+
+支持文件上传的增强版代理。
+
+```python
+from cerebellum import CerebellumPlus
+
+with CerebellumPlus(config=config) as agent:
+    # 单文件处理
+    result = agent.process_file(file_data, "file.pdf", "总结内容")
+    
+    # 批量处理
+    result = agent.process_files(
+        files=[
+            (file_data1, "file1.pdf"),
+            (file_data2, "file2.txt")
+        ],
+        task="比较这两个文件"
+    )
 ```
 
 ## 文件筛选
@@ -168,8 +260,6 @@ def run_task(
 - 其他：`html`, `css`, `zip`, `tar`, `gz`...
 
 ## 命令行工具 (CBot)
-
-项目提供了命令行工具 `cbot.py`：
 
 ```bash
 # 执行任务
@@ -196,36 +286,79 @@ TAVILY_API_KEY=your_tavily_api_key
 
 ## 完整示例
 
+### 示例1: 基本使用
+
 ```python
 from cerebellum import Cerebellum, CerebellumConfig
 from pathlib import Path
 
-# 配置
 config = CerebellumConfig(
     skills_dir=Path("./skills"),
     debug=True
 )
 
-# 执行任务
 with Cerebellum(config=config) as agent:
     result = agent.run("生成一个斐波那契数列图片")
     
     if result["success"]:
         print(f"结果: {result['message']}")
         
-        # 处理返回的文件
         for file in result["files"]:
-            print(f"\n文件: {file.name}")
-            print(f"类型: {file.type}")
-            print(f"大小: {len(file.get_bytes())} bytes")
-            
-            # 保存到本地
             with open(f"output/{file.name}", "wb") as f:
                 f.write(file.get_bytes())
 ```
 
-## 注意事项
+### 示例2: 文件上传处理
 
-1. **文件不保存到本地** - `run()` 返回 `FileData` 对象，需要手动保存
-2. **沙盒自动清理** - 任务完成后自动清理沙盒资源
-3. **技能目录** - 可通过 `skills_dir` 指定自定义技能文件夹
+```python
+from cerebellum import CerebellumPlus, CerebellumConfig
+
+config = CerebellumConfig(debug=True)
+
+with CerebellumPlus(config=config) as agent:
+    # 读取 PDF 文件
+    with open("report.pdf", "rb") as f:
+        pdf_data = f.read()
+    
+    # 上传并分析
+    result = agent.process_file(
+        file_data=pdf_data,
+        filename="report.pdf",
+        task="请总结这份报告的主要内容，并提取关键数据"
+    )
+    
+    print(f"结果: {result['message']}")
+    print(f"生成文件: {result['files']}")
+```
+
+### 示例3: 批量文件处理
+
+```python
+from cerebellum import CerebellumPlus
+
+files = [
+    ("数据1.csv", open("data1.csv", "rb").read()),
+    ("数据2.csv", open("data2.csv", "rb").read()),
+]
+
+with CerebellumPlus() as agent:
+    result = agent.process_files(files, "分析这两个CSV文件的差异")
+```
+
+### 示例4: 手动文件解析
+
+```python
+from cerebellum import parse_file, check_file
+
+# 安全检查
+security = check_file(file_data, "document.pdf")
+if not security.is_safe:
+    print(f"不安全: {security.error}")
+    exit()
+
+# 解析内容
+parsed = parse_file(file_data, "document.pdf")
+if parsed.is_valid:
+    print(f"提取的文本:\n{parsed.text}")
+    print(f"元数据: {parsed.metadata}")
+```

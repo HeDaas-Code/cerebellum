@@ -7,8 +7,14 @@ config = CerebellumConfig(
     debug=False
 )
 
-with Cerebellum(config=config) as agent:
-    result = agent.run("获取北京气温数据，生成北京2026年3月一日天气分析图")
+with open("doc.txt", "rb") as f:
+    data = f.read()
+
+with Cerebellum() as agent:
+    result = agent.run(
+        task="总结这份文档,并生成一个图表",
+        files=[(data, "doc.txt")]  # 可选参数
+    )
     
     # 访问返回的文件
     for file in result["files"]:
