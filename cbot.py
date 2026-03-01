@@ -4,7 +4,7 @@ from pathlib import Path
 # 配置技能文件夹
 config = CerebellumConfig(
     skills_dir=Path("./skills"),  # 自定义技能目录
-    debug=False
+    debug=True
 )
 
 with open("doc.txt", "rb") as f:
