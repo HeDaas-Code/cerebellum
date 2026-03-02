@@ -6,7 +6,7 @@ coverage.xml
 *.cover
 logs/
 docs/
-cdot.py
+cbot.py
 doc.txt
 output/
 *.db
