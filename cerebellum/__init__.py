@@ -242,7 +242,43 @@ class Cerebellum:
         ext = filename.lower().split('.')[-1] if '.' in filename else ''
         return ext in valid_extensions
     
-    def _download_files_from_sandbox(self) -> List[FileData]:
+    def _extract_file_paths(self, message: str) -> List[str]:
+        """从智能体回复中提取文件路径"""
+        import re
+        file_paths = []
+        
+        # 匹配文件路径的正则表达式
+        patterns = [
+            r'/home/daytona/workspace/[\w\-\.]+\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)',  # 完整路径
+            r'\b([\w\-]+)\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)\b'  # 文件名
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, message)
+            if matches:
+                for match in matches:
+                    if isinstance(match, tuple):
+                        # 处理捕获组的情况
+                        if len(match) >= 2 and match[0]:
+                            filename = f"{match[0]}.{match[1]}"
+                            file_paths.append(f"/home/daytona/workspace/{filename}")
+                    else:
+                        # 清理路径中的特殊字符
+                        cleaned_path = re.sub(r'[`"\']', '', match)
+                        if cleaned_path:
+                            file_paths.append(cleaned_path)
+        
+        # 过滤无效路径
+        valid_extensions = {'.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.txt', '.md'}
+        valid_paths = []
+        for path in file_paths:
+            if any(path.lower().endswith(ext) for ext in valid_extensions):
+                valid_paths.append(path)
+        
+        # 去重
+        return list(set(valid_paths))
+    
+    def _download_files_from_sandbox(self, specific_paths: List[str] = None) -> List[FileData]:
         """从沙盒下载文件并返回 FileData 列表"""
         files_data = []
         
@@ -253,31 +289,49 @@ class Cerebellum:
             logger.info("正在获取沙盒文件列表...")
             downloaded_names = set()
             
-            all_files = []
+            files = []
             
-            try:
-                result = self.sandbox._process.exec("ls /home/daytona/workspace/", timeout=10)
-                if result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        if line.strip():
-                            all_files.append(f"/home/daytona/workspace/{line.strip()}")
-            except Exception as e:
-                logger.debug(f"ls workspace 失败: {e}")
-            
-            try:
-                result = self.sandbox._process.exec(
-                    "find /home/daytona/workspace -type f -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.pdf' 2>/dev/null",
-                    timeout=15
-                )
-                if result.stdout:
-                    for line in result.stdout.strip().split('\n'):
-                        if line.strip() and line.strip() not in all_files:
-                            all_files.append(line.strip())
-            except Exception as e:
-                logger.debug(f"find 失败: {e}")
-            
-            valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.csv', '.txt', '.md')
-            files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+            # 优先使用指定的文件路径
+            if specific_paths:
+                files = specific_paths
+                logger.info(f"使用指定的文件路径: {len(files)} 个")
+                # 列出工作目录文件用于调试
+                try:
+                    result = self.sandbox._process.exec("ls -la /home/daytona/workspace/", timeout=10)
+                    if result.stdout:
+                        logger.debug(f"沙盒工作目录文件:\n{result.stdout}")
+                except Exception as e:
+                    logger.debug(f"ls workspace 失败: {e}")
+            else:
+                # 常规文件搜索
+                all_files = []
+                
+                try:
+                    result = self.sandbox._process.exec("ls -la /home/daytona/workspace/", timeout=10)
+                    if result.stdout:
+                        logger.debug(f"沙盒工作目录文件:\n{result.stdout}")
+                        for line in result.stdout.strip().split('\n'):
+                            if line.strip() and not line.startswith('total') and not line.startswith('drwxr'):
+                                file_name = line.split()[-1]
+                                all_files.append(f"/home/daytona/workspace/{file_name}")
+                except Exception as e:
+                    logger.debug(f"ls workspace 失败: {e}")
+                
+                try:
+                    result = self.sandbox._process.exec(
+                        "find /home/daytona/workspace -type f 2>/dev/null",
+                        timeout=15
+                    )
+                    if result.stdout:
+                        logger.debug(f"find 命令结果:\n{result.stdout}")
+                        for line in result.stdout.strip().split('\n'):
+                            if line.strip() and line.strip() not in all_files:
+                                all_files.append(line.strip())
+                except Exception as e:
+                    logger.debug(f"find 失败: {e}")
+                
+                valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.csv', '.txt', '.md')
+                files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
             
             if not files:
                 logger.info("未发现有效文件")
@@ -291,14 +345,29 @@ class Cerebellum:
                     if file_name in downloaded_names:
                         continue
                     
+                    # 跳过文件存在检查，直接尝试读取
+                    
                     if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
                         from base64 import b64decode
+                        logger.debug(f"正在下载图片: {file_path}")
                         b64_result = self.sandbox._process.exec(f"base64 -w0 '{file_path}'", timeout=30)
-                        bstdout = b64_result.stdout if hasattr(b64_result, 'stdout') else ""
+                        # 处理 ExecuteResponse 对象 - 使用 result 属性
+                        if hasattr(b64_result, 'result'):
+                            bstdout = b64_result.result
+                        else:
+                            bstdout = str(b64_result)
+                        # 确保 bstdout 是字符串
+                        if not isinstance(bstdout, str):
+                            bstdout = str(bstdout)
                         content = b64decode(bstdout.strip()) if bstdout.strip() else b""
+                        logger.debug(f"下载完成: {len(content)} 字节")
                     else:
                         content_result = self.sandbox._process.exec(f"cat '{file_path}'", timeout=30)
-                        content = content_result.stdout if hasattr(content_result, 'stdout') else ""
+                        if hasattr(content_result, 'result'):
+                            content = content_result.result
+                        else:
+                            content = str(content_result)
+                        # 确保 content 是字节
                         if isinstance(content, str):
                             content = content.encode('utf-8')
                     
@@ -671,7 +740,9 @@ class Cerebellum:
                                     elif content.strip():
                                         logger.info(f"[步骤 {step_count}] AI: {content}...")
                                 elif msg_type == "ToolMessage":
-                                    logger.debug(f"[步骤 {step_count}] 工具返回")
+                                    tool_name = getattr(last_msg, 'name', 'unknown')
+                                    tool_content = str(last_msg.content)[:200] if last_msg.content else ""
+                                    logger.info(f"[步骤 {step_count}] 工具返回 [{tool_name}]: {tool_content}...")
                 
                 agent_result = event if event else None
                 
@@ -695,7 +766,14 @@ class Cerebellum:
                 logger.warning(f"Agent 返回异常: {agent_result}")
                 result["message"] = "Agent 未返回有效结果"
             
-            downloaded_files = self._download_files_from_sandbox()
+            # 从智能体回复中提取文件路径
+            file_paths_from_message = self._extract_file_paths(result["message"])
+            if file_paths_from_message:
+                logger.info(f"从智能体回复中提取到 {len(file_paths_from_message)} 个文件路径")
+                for path in file_paths_from_message:
+                    logger.info(f"  - {path}")
+            
+            downloaded_files = self._download_files_from_sandbox(file_paths_from_message)
             if downloaded_files:
                 result["files"] = [
                     {"name": f.name, "content": f.content, "type": f.type}
