@@ -6,6 +6,9 @@ Cerebellum 智能代理库
 2. 使用 Daytona 沙盒执行代码和命令
 3. 加载预设的技能（Skills）来处理各种任务
 4. 支持 Tavily 联网搜索
+5. 多智能体编排架构
+6. 任务缓存与去重
+7. 自主反思链错误处理
 
 用法:
     from cerebellum import Cerebellum, CerebellumConfig
@@ -30,22 +33,24 @@ Cerebellum 智能代理库
 
 import os
 import sys
-import logging
+import time
+import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
-from dataclasses import dataclass
-from base64 import b64encode, b64decode
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_community.tools import TavilySearchResults
+
+from .utils import setup_logging, logger, log_function_call, log_execution_time
 
 try:
     from daytona import Daytona
     from daytona_sdk.common.daytona import DaytonaConfig
     from langchain_daytona import DaytonaSandbox
 except ImportError:
-    print("警告: Daytona SDK 未安装，将使用默认后端")
+    logger.warning("Daytona SDK 未安装，将使用默认后端")
     Daytona = None
     DaytonaConfig = None
     DaytonaSandbox = None
@@ -54,54 +59,24 @@ try:
     from deepagents import create_deep_agent
     from deepagents.backends.utils import create_file_data
 except ImportError:
-    print("错误: deepagents 未安装，请运行: pip install deepagents")
+    logger.error("deepagents 未安装，请运行: pip install deepagents")
     sys.exit(1)
 
+from .types import (
+    FileData, SubTask, SubTaskStatus, TaskStatus, TaskResult,
+    ReflectionHistory, CacheResult, CacheAction
+)
+from .config import CerebellumConfig, CacheConfig, ReflectionConfig, SandboxConfig
+from .data import DatabaseManager
+from .data.task_encoder import TaskEncoder
+from .data.similarity import SimilarityChecker
+from .data.cache_manager import CacheManager
+from .tools import SandboxManager
+from .reflection import ReflectionChainExecutor
+from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter
 
-# 默认技能目录路径
+
 DEFAULT_SKILLS_DIR = Path(__file__).parent / "skills"
-
-
-@dataclass
-class FileData:
-    """文件数据类"""
-    name: str
-    content: Union[bytes, str]
-    type: str = "text"
-    
-    def __post_init__(self):
-        if isinstance(self.content, bytes):
-            self.type = "binary"
-        else:
-            self.type = "text"
-    
-    def get_bytes(self) -> bytes:
-        """获取字节内容"""
-        if isinstance(self.content, bytes):
-            return self.content
-        return self.content.encode('utf-8')
-    
-    def get_text(self) -> str:
-        """获取文本内容"""
-        if isinstance(self.content, str):
-            return self.content
-        return self.content.decode('utf-8')
-    
-    def get_base64(self) -> str:
-        """获取 Base64 编码内容"""
-        return b64encode(self.get_bytes()).decode('ascii')
-
-
-@dataclass
-class CerebellumConfig:
-    """Cerebellum 配置类"""
-    dashscope_api_key: str = ""
-    dashscope_base_url: str = "https://coding.dashscope.aliyuncs.com/v1"
-    dashscope_model: str = "glm-5"
-    daytona_api_key: str = ""
-    tavily_api_key: str = ""
-    skills_dir: Optional[Path] = None
-    debug: bool = False
 
 
 class Cerebellum:
@@ -113,6 +88,9 @@ class Cerebellum:
     - Daytona 沙盒
     - 技能系统
     - 联网搜索
+    - 多智能体编排
+    - 任务缓存与去重
+    - 自主反思链
     - 返回文件数据而非本地保存
     """
     
@@ -143,33 +121,30 @@ class Cerebellum:
         self.llm = None
         self.backend = None
         self.sandbox = None
+        self.sandbox_manager = None
         self.agent = None
         self.skills_files = {}
+        
+        self.db = None
+        self.cache_manager = None
+        self.similarity_checker = None
+        self.reflection_executor = None
+        self.planner = None
+        self.scheduler = None
+        self.reporter = None
+        self.web_search = None
         
         self._setup_logging()
     
     def _setup_logging(self):
-        """配置日志"""
+        """配置日志系统"""
+        setup_logging(debug=self.debug)
         if self.debug:
-            log_dir = Path("logs")
-            log_dir.mkdir(exist_ok=True)
-            
-            from datetime import datetime
-            log_file = log_dir / f"cerebellum_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            
-            logging.basicConfig(
-                level=logging.DEBUG,
-                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                handlers=[
-                    logging.FileHandler(log_file, encoding='utf-8'),
-                    logging.StreamHandler(sys.stdout)
-                ]
-            )
-            print(f"✓ 调试模式已启用")
-            print(f"✓ 日志文件: {log_file}\n")
+            logger.debug("调试模式已启用")
     
     def _create_llm(self) -> ChatOpenAI:
         """创建 LLM 客户端"""
+        logger.debug(f"创建 LLM 客户端: model={self.config.dashscope_model}")
         return ChatOpenAI(
             model=self.config.dashscope_model,
             base_url=self.config.dashscope_base_url,
@@ -181,43 +156,45 @@ class Cerebellum:
     def _create_sandbox(self):
         """创建沙盒"""
         if Daytona is None:
-            print("警告: Daytona SDK 不可用")
+            logger.warning("Daytona SDK 不可用")
             return None, None
         
         try:
+            logger.info("正在创建沙盒环境...")
             daytona_config = DaytonaConfig(
                 api_key=self.config.daytona_api_key if self.config.daytona_api_key else None
             )
             daytona = Daytona(config=daytona_config)
             
-            print("  正在创建沙盒...")
+            logger.debug("调用 daytona.create()...")
             sandbox = daytona.create()
             
-            print("  等待沙盒启动...")
+            logger.debug("等待沙盒启动...")
             sandbox.wait_for_sandbox_start(timeout=60)
-            print(f"  沙盒状态: {sandbox.state}")
+            logger.info(f"沙盒已启动，状态: {sandbox.state}")
             
             work_dir = sandbox.get_work_dir()
-            print(f"  沙盒工作目录: {work_dir}")
+            logger.debug(f"沙盒工作目录: {work_dir}")
             
-            print("  正在初始化沙盒环境...")
+            logger.debug("初始化沙盒环境...")
             sandbox._process.exec("mkdir -p workspace && chmod 755 workspace", timeout=30)
             
             backend = DaytonaSandbox(sandbox=sandbox)
             
-            print(f"✓ Daytona 沙盒创建成功 (ID: {sandbox.id})")
+            logger.success(f"Daytona 沙盒创建成功 (ID: {sandbox.id})")
             return backend, sandbox
             
         except Exception as e:
-            print(f"✗ 创建沙盒失败: {e}")
+            logger.error(f"创建沙盒失败: {e}")
             return None, None
     
     def _load_skills_files(self, skills_path: Path) -> Dict[str, Any]:
         """加载技能文件"""
         if not skills_path.exists():
-            logging.warning(f"技能目录不存在: {skills_path}")
+            logger.warning(f"技能目录不存在: {skills_path}")
             return {}
         
+        logger.debug(f"加载技能目录: {skills_path}")
         skills_files = {}
         for skill_dir in skills_path.iterdir():
             if not skill_dir.is_dir():
@@ -233,9 +210,9 @@ class Cerebellum:
                         content = file_path.read_text(encoding="utf-8")
                         skills_files[virtual_path] = create_file_data(content)
                     except Exception as e:
-                        logging.warning(f"无法读取技能文件 {file_path}: {e}")
+                        logger.warning(f"无法读取技能文件 {file_path}: {e}")
         
-        logging.info(f"已加载 {len(skills_files)} 个技能文件")
+        logger.info(f"已加载 {len(skills_files)} 个技能文件")
         return skills_files
     
     def _get_file_type(self, filename: str) -> str:
@@ -248,23 +225,17 @@ class Cerebellum:
     
     def _is_valid_file(self, filename: str) -> bool:
         """检查是否为有效的用户文件（排除系统文件）"""
-        # 排除以点开头的隐藏文件
         if filename.startswith('.'):
             return False
         
-        # 排除常见系统目录
         exclude_dirs = ['.cache', '.local', '.npm', '.git', 'node_modules', '__pycache__', '.venv']
         for ex_dir in exclude_dirs:
             if ex_dir in filename:
                 return False
         
-        # 只保留有意义的文件后缀
         valid_extensions = [
-            # 图片
             'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico',
-            # 文档
             'pdf', 'doc', 'docx', 'txt', 'md', 'rtf', 'odt',
-            # 表格
             'csv', 'xlsx', 'xls', 'ods'
         ]
         
@@ -279,85 +250,76 @@ class Cerebellum:
             return files_data
         
         try:
-            print("\n正在获取沙盒文件列表...")
+            logger.info("正在获取沙盒文件列表...")
             downloaded_names = set()
             
-            # 方法1: 使用 exec 命令搜索 /home/daytona 目录
-            print("  使用 exec 方法搜索文件...")
-            file_result = self.sandbox._process.exec("find /home/daytona -type f 2>/dev/null | head -30", timeout=30)
-            stdout = file_result.stdout if hasattr(file_result, 'stdout') else file_result.output if hasattr(file_result, 'output') else ""
-            files = [f.strip() for f in stdout.strip().split('\n') if f.strip()]
+            all_files = []
             
-            if files:
-                print(f"  发现 {len(files)} 个文件...")
-                for file_path in files:
-                    try:
-                        file_name = Path(file_path).name
-                        
-                        # 筛选有效文件
-                        if not self._is_valid_file(file_name):
-                            continue
-                        
-                        if file_name in downloaded_names:
-                            continue
-                        
-                        # 读取文件内容
-                        content_result = self.sandbox._process.exec(f"cat '{file_path}'", timeout=30)
-                        cstdout = content_result.stdout if hasattr(content_result, 'stdout') else content_result.output if hasattr(content_result, 'output') else ""
-                        
-                        # 根据文件类型处理
-                        if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
-                            b64_result = self.sandbox._process.exec(f"base64 -w0 '{file_path}'", timeout=30)
-                            bstdout = b64_result.stdout if hasattr(b64_result, 'stdout') else b64_result.output if hasattr(b64_result, 'output') else ""
-                            content = b64decode(bstdout.strip())
-                        else:
-                            content = cstdout
-                        
-                        files_data.append(FileData(
-                            name=file_name,
-                            content=content,
-                            type=self._get_file_type(file_name)
-                        ))
-                        downloaded_names.add(file_name)
-                        print(f"  ✓ 已读取: {file_name}")
-                        
-                    except Exception as e:
-                        print(f"  ✗ 读取失败 {file_path}: {e}")
+            try:
+                result = self.sandbox._process.exec("ls /home/daytona/workspace/", timeout=10)
+                if result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip():
+                            all_files.append(f"/home/daytona/workspace/{line.strip()}")
+            except Exception as e:
+                logger.debug(f"ls workspace 失败: {e}")
             
-            # 如果 exec 方法没有找到文件，尝试使用 SDK 方法
-            if not files_data:
-                print("  尝试使用 SDK 方法...")
+            try:
+                result = self.sandbox._process.exec(
+                    "find /home/daytona/workspace -type f -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.pdf' 2>/dev/null",
+                    timeout=15
+                )
+                if result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip() and line.strip() not in all_files:
+                            all_files.append(line.strip())
+            except Exception as e:
+                logger.debug(f"find 失败: {e}")
+            
+            valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.csv', '.txt', '.md')
+            files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+            
+            if not files:
+                logger.info("未发现有效文件")
+                return files_data
+            
+            logger.info(f"发现 {len(files)} 个文件")
+            for file_path in files:
                 try:
-                    # 尝试列出 output 和 workspace 目录
-                    for dir_name in ["output", "workspace", ""]:
-                        try:
-                            files = self.sandbox.fs.list_files(dir_name) if dir_name else self.sandbox.fs.list_files(".")
-                            for f in files:
-                                # 筛选有效文件
-                                if not self._is_valid_file(f.name):
-                                    continue
-                                if f.is_dir or f.name in downloaded_names:
-                                    continue
-                                try:
-                                    # 构建完整路径
-                                    file_path = f"/home/daytona/{dir_name}/{f.name}" if dir_name else f"/home/daytona/{f.name}"
-                                    content = self.sandbox.fs.download_file(file_path)
-                                    files_data.append(FileData(
-                                        name=f.name,
-                                        content=content,
-                                        type=self._get_file_type(f.name)
-                                    ))
-                                    downloaded_names.add(f.name)
-                                    print(f"  ✓ SDK下载成功: {f.name}")
-                                except Exception as sdk_err:
-                                    print(f"  SDK下载 {f.name} 失败: {sdk_err}")
-                        except Exception:
-                            continue
-                except Exception as sdk_err:
-                    print(f"  SDK 方法失败: {sdk_err}")
+                    file_name = Path(file_path).name
+                    
+                    if file_name in downloaded_names:
+                        continue
+                    
+                    if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
+                        from base64 import b64decode
+                        b64_result = self.sandbox._process.exec(f"base64 -w0 '{file_path}'", timeout=30)
+                        bstdout = b64_result.stdout if hasattr(b64_result, 'stdout') else ""
+                        content = b64decode(bstdout.strip()) if bstdout.strip() else b""
+                    else:
+                        content_result = self.sandbox._process.exec(f"cat '{file_path}'", timeout=30)
+                        content = content_result.stdout if hasattr(content_result, 'stdout') else ""
+                        if isinstance(content, str):
+                            content = content.encode('utf-8')
+                    
+                    if not content:
+                        logger.warning(f"文件内容为空: {file_name}")
+                        continue
+                    
+                    files_data.append(FileData(
+                        name=file_name,
+                        content=content,
+                        type=self._get_file_type(file_name)
+                    ))
+                    downloaded_names.add(file_name)
+                    logger.info(f"已下载文件: {file_name} ({len(content)} 字节)")
+                    
+                except Exception as e:
+                    logger.warning(f"读取文件失败 {file_path}: {e}")
+                    continue
                         
         except Exception as e:
-            print(f"  获取文件失败: {e}")
+            logger.error(f"获取文件失败: {e}")
         
         return files_data
     
@@ -367,16 +329,17 @@ class Cerebellum:
             return
         
         try:
-            print("\n正在清理沙盒资源...")
+            logger.info("正在清理沙盒资源...")
             self.sandbox.stop()
             self.sandbox.delete()
-            print("✓ 沙盒已停止并删除")
+            logger.success("沙盒已停止并删除")
             self.sandbox = None
         except Exception as e:
-            print(f"  警告: 清理沙盒时出错: {e}")
+            logger.warning(f"清理沙盒时出错: {e}")
     
     def _create_agent(self):
         """创建 Agent"""
+        logger.debug("创建 Agent...")
         system_prompt = """你是一个强大的 AI 智能代理，具有以下增强能力：
 
 ## 核心能力
@@ -405,19 +368,6 @@ class Cerebellum:
 - **必须返回文件数据**：任务完成后，将生成的文件数据返回给调用者
 - **可用工具**：execute(执行Python) + write_file(创建文件)
 
-## 增强功能
-- 任务分析与拆分
-- 工具与技能规划
-- TODO列表生成
-- 分步执行机制
-- 技能扩展功能
-- 文档处理专项要求
-- 代码质量标准
-
-## 重要提示
-- 当用户要求创建文件、执行代码时，必须使用沙盒环境
-- 沙盒的工作目录是 /home/daytona
-
 ## 联网搜索
 - 当你需要获取最新信息时，可以使用 Tavily 搜索工具
 - 对于需要准确信息的任务（如游戏攻略、数据查询等），必须先搜索再处理
@@ -430,7 +380,7 @@ class Cerebellum:
         agent_kwargs = {
             "model": self.llm,
             "system_prompt": system_prompt,
-            "debug": self.debug,
+            "debug": False,
         }
         
         if self.backend is not None:
@@ -438,40 +388,132 @@ class Cerebellum:
         
         if self.config.tavily_api_key:
             try:
-                tavily_tool = TavilySearchResults(api_key=self.config.tavily_api_key, max_results=5)
-                agent_kwargs["tools"] = [tavily_tool]
-                print("✓ 已加载 Tavily 联网搜索工具")
+                try:
+                    from langchain_tavily import TavilySearch
+                    self.web_search = TavilySearch(api_key=self.config.tavily_api_key, max_results=5)
+                except ImportError:
+                    from langchain_community.tools import TavilySearchResults
+                    self.web_search = TavilySearchResults(api_key=self.config.tavily_api_key, max_results=5)
+                agent_kwargs["tools"] = [self.web_search]
+                logger.info("已加载 Tavily 联网搜索工具")
             except Exception as e:
-                print(f"警告: 无法加载 Tavily 搜索工具: {e}")
+                logger.warning(f"无法加载 Tavily 搜索工具: {e}")
         
         skills_path = self.config.skills_dir or DEFAULT_SKILLS_DIR
         if skills_path.exists():
             skills_posix_path = str(skills_path).replace("\\", "/")
             agent_kwargs["skills"] = [skills_posix_path]
-            print(f"✓ 已加载技能目录: {skills_path}")
+            logger.info(f"已加载技能目录: {skills_path}")
         
         self.agent = create_deep_agent(**agent_kwargs)
-        print("✓ Agent 初始化完成\n")
+        logger.success("Agent 初始化完成")
+    
+    def _init_cache_system(self):
+        """初始化缓存系统"""
+        if self.config.database_path:
+            logger.debug(f"初始化缓存系统: {self.config.database_path}")
+            self.db = DatabaseManager(self.config.database_path)
+            
+            if self.config.tavily_api_key:
+                self.similarity_checker = SimilarityChecker(
+                    llm=self.llm,
+                    db=self.db,
+                    threshold=self.config.cache.similarity_threshold
+                )
+            
+            self.cache_manager = CacheManager(
+                db=self.db,
+                similarity_checker=self.similarity_checker,
+                config=self.config.cache
+            )
+            logger.success("缓存系统初始化完成")
+    
+    def _init_orchestrator(self):
+        """初始化编排器"""
+        logger.debug("初始化编排器...")
+        self.planner = TaskPlanner(llm=self.llm)
+        self.reporter = TaskReporter()
+        
+        if self.sandbox_manager and self.llm:
+            self.reflection_executor = ReflectionChainExecutor(
+                llm=self.llm,
+                sandbox=self.sandbox_manager,
+                web_search=self.web_search
+            )
+            
+            self.scheduler = TaskScheduler(
+                llm=self.llm,
+                sandbox=self.sandbox_manager,
+                reflection_executor=self.reflection_executor
+            )
+        
+        logger.success("编排器初始化完成")
     
     def initialize(self):
         """初始化 Agent（创建 LLM、沙盒、Agent）"""
-        print("正在初始化 Cerebellum 智能代理...\n")
+        logger.info("正在初始化 Cerebellum 智能代理...")
         
-        print("正在连接阿里百炼 LLM...")
+        logger.info("正在连接阿里百炼 LLM...")
         self.llm = self._create_llm()
-        print(f"  模型: {self.config.dashscope_model}")
+        logger.info(f"模型: {self.config.dashscope_model}")
         
-        print("\n正在创建沙盒环境...")
-        logging.info("开始创建沙盒环境...")
+        logger.info("正在创建沙盒环境...")
         self.backend, self.sandbox = self._create_sandbox()
+        
+        if self.sandbox:
+            self.sandbox_manager = SandboxManager(
+                api_key=self.config.daytona_api_key,
+                config=self.config.sandbox
+            )
+            self.sandbox_manager._sandbox = self.sandbox
+            self.sandbox_manager._daytona = Daytona(config=DaytonaConfig(
+                api_key=self.config.daytona_api_key if self.config.daytona_api_key else None
+            )) if Daytona else None
         
         skills_path = self.config.skills_dir or DEFAULT_SKILLS_DIR
         self.skills_files = self._load_skills_files(skills_path)
         
-        print("\n正在初始化 Agent...")
+        logger.info("正在初始化 Agent...")
         self._create_agent()
         
+        logger.info("正在初始化缓存系统...")
+        self._init_cache_system()
+        
+        logger.info("正在初始化编排器...")
+        self._init_orchestrator()
+        
+        logger.success("Cerebellum 初始化完成")
         return self
+    
+    def _check_cache(self, task: str, files: List[tuple] = None) -> Optional[CacheResult]:
+        """检查任务缓存"""
+        if not self.cache_manager:
+            return None
+        
+        logger.debug("检查任务缓存...")
+        task_hash, normalized, intent, file_hashes = TaskEncoder.encode(task, files)
+        
+        cache_result = self.cache_manager.check_cache(task_hash, normalized, intent)
+        
+        if cache_result.found:
+            logger.info(f"缓存命中，相似度: {cache_result.similarity_score:.2f}")
+            self.reporter.report_cache_hit(
+                task_hash, 
+                cache_result.similarity_score,
+                "直接返回" if cache_result.action == CacheAction.DIRECT_RETURN else "继续处理"
+            )
+        
+        return cache_result
+    
+    def _store_cache(self, task: str, result_message: str, files: List[FileData]):
+        """存储任务结果到缓存"""
+        if not self.cache_manager:
+            return
+        
+        logger.debug("存储任务结果到缓存...")
+        task_hash, _, _, _ = TaskEncoder.encode(task)
+        self.cache_manager.store_cache(task_hash, result_message, files)
+        logger.debug("缓存存储完成")
     
     def run(
         self, 
@@ -500,153 +542,273 @@ class Cerebellum:
         if self.agent is None:
             self.initialize()
         
-        print(f"执行任务: {task}\n")
+        start_time = time.time()
+        
+        logger.info(f"执行任务: {task}")
         result = {
             "success": False,
             "message": "",
             "files": [],
-            "uploaded_files": []
+            "uploaded_files": [],
+            "subtasks": [],
+            "skills_used": []
         }
         
-        # 处理上传的文件
-        task_prompt = task
-        if files:
-            task_prompt = self._build_file_prompt(task, files, result)
+        cache_result = self._check_cache(task, files)
+        if cache_result and cache_result.action == CacheAction.DIRECT_RETURN:
+            result["success"] = True
+            result["message"] = cache_result.cached_result.get("message", "从缓存返回")
+            result["files"] = [
+                {"name": f.name, "content": f.content, "type": f.type}
+                for f in cache_result.cached_files
+            ]
+            logger.success("从缓存返回结果")
+            return result
+        
+        if files and self.sandbox_manager:
+            logger.info("正在上传文件到沙盒...")
+            for file_data, filename in files:
+                if isinstance(file_data, bytes):
+                    sandbox_path = f"/home/daytona/workspace/{filename}"
+                    if self.sandbox_manager.upload(file_data, sandbox_path):
+                        logger.debug(f"已上传: {filename} -> {sandbox_path}")
+                    else:
+                        logger.warning(f"上传失败: {filename}")
         
         try:
-            print("[正在处理...]")
-            agent_result = self.agent.invoke(
-                {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": task_prompt
-                        }
-                    ],
-                    "files": self.skills_files
-                }
-            )
+            logger.info("=" * 50)
+            logger.info("阶段 1: 任务规划")
+            logger.info("=" * 50)
+            
+            intent, expected_outputs = self.planner.analyze_intent(task)
+            logger.info(f"任务意图: {intent}")
+            logger.info(f"预期输出: {expected_outputs}")
+            
+            files_info = [f[1] for f in files] if files else None
+            subtasks = self.planner.split_task(task, files_info)
+            
+            if subtasks:
+                logger.info(f"任务拆分为 {len(subtasks)} 个子任务:")
+                for i, st in enumerate(subtasks, 1):
+                    deps = f" (依赖: {', '.join(st.dependencies)})" if st.dependencies else ""
+                    logger.info(f"  {i}. [{st.priority}] {st.name}{deps}")
+                result["subtasks"] = [
+                    {"id": st.id, "name": st.name, "description": st.description, "priority": st.priority}
+                    for st in subtasks
+                ]
+            
+            available_skills = list(self.skills_files.keys()) if self.skills_files else []
+            if available_skills:
+                logger.info(f"可用技能: {len(available_skills)} 个")
+                skill_mapping = self.planner.match_skills(subtasks, available_skills)
+                if skill_mapping:
+                    logger.info("技能匹配结果:")
+                    for st_id, skill in skill_mapping.items():
+                        st = next((s for s in subtasks if s.id == st_id), None)
+                        if st:
+                            logger.info(f"  - {st.name} -> {skill}")
+                        result["skills_used"].append(skill)
+            
+            logger.info("=" * 50)
+            logger.info("阶段 2: 任务执行")
+            logger.info("=" * 50)
+            
+            task_prompt = task
+            if files:
+                task_prompt = self._build_file_prompt(task, files, result)
+            
+            skill_hints = ""
+            if result["skills_used"]:
+                skill_hints = f"\n\n可用技能: {', '.join(set(result['skills_used'][:5]))}\n可以通过 skills 工具调用这些技能来完成任务。"
+            
+            enhanced_prompt = f"""{task_prompt}
+
+{skill_hints}
+
+请按照以下步骤执行:
+1. 分析任务需求
+2. 选择合适的工具和技能
+3. 执行任务
+4. 返回结果
+
+如果需要生成文件，请保存到 /home/daytona/workspace/ 目录。"""
+            
+            agent_result = None
+            agent_error = None
+            step_count = 0
+            
+            try:
+                for event in self.agent.stream(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": enhanced_prompt
+                            }
+                        ],
+                        "files": self.skills_files
+                    },
+                    stream_mode="values"
+                ):
+                    if event:
+                        step_count += 1
+                        if "messages" in event:
+                            msgs = event["messages"]
+                            if msgs:
+                                last_msg = msgs[-1]
+                                msg_type = type(last_msg).__name__
+                                content = ""
+                                if hasattr(last_msg, "content"):
+                                    content = str(last_msg.content)[:150] if last_msg.content else ""
+                                
+                                if msg_type == "AIMessage" and content.strip():
+                                    if "tool_calls" in last_msg.additional_kwargs:
+                                        tool_calls = last_msg.additional_kwargs["tool_calls"]
+                                        if tool_calls:
+                                            for tc in tool_calls:
+                                                func_name = tc.get("function", {}).get("name", "unknown")
+                                                logger.info(f"[步骤 {step_count}] 调用工具: {func_name}")
+                                    elif content.strip():
+                                        logger.info(f"[步骤 {step_count}] AI: {content}...")
+                                elif msg_type == "ToolMessage":
+                                    logger.debug(f"[步骤 {step_count}] 工具返回")
+                
+                agent_result = event if event else None
+                
+            except Exception as e:
+                agent_error = e
+                logger.error(f"Stream 错误: {type(e).__name__}: {e}")
+            
+            if agent_error:
+                raise agent_error
+            
+            logger.info("=" * 50)
+            logger.info("阶段 3: 结果收集")
+            logger.info("=" * 50)
             
             if agent_result and "messages" in agent_result:
                 last_message = agent_result["messages"][-1]
-                result["message"] = last_message.content if hasattr(last_message, "content") else str(last_message)
-                print(f"\n结果:\n{result['message']}")
+                result["message"] = last_message.content if hasattr(last_message, 'content') else str(last_message)
+                logger.info("任务处理完成")
                 result["success"] = True
+            else:
+                logger.warning(f"Agent 返回异常: {agent_result}")
+                result["message"] = "Agent 未返回有效结果"
             
+            downloaded_files = self._download_files_from_sandbox()
+            if downloaded_files:
+                result["files"] = [
+                    {"name": f.name, "content": f.content, "type": f.type}
+                    for f in downloaded_files
+                ]
+                logger.info(f"已获取 {len(downloaded_files)} 个文件")
+            
+            if result["success"]:
+                self._store_cache(task, result["message"], downloaded_files)
+                
+        except TimeoutError as e:
+            result["message"] = f"执行超时: {str(e)}"
+            logger.error(f"任务执行超时: {e}")
         except Exception as e:
-            print(f"错误: {e}")
-            result["message"] = str(e)
+            result["message"] = f"执行失败: {str(e)}"
+            logger.error(f"任务执行失败: {e}")
         
-        finally:
-            # 下载文件数据（不保存到本地）
-            result["files"] = self._download_files_from_sandbox()
-            
-            # 清理沙盒
-            self._cleanup_sandbox()
+        execution_time_ms = int((time.time() - start_time) * 1000)
+        result["execution_time_ms"] = execution_time_ms
+        log_execution_time("任务", execution_time_ms)
         
         return result
     
-    def _build_file_prompt(
-        self, 
-        task: str, 
-        files: List[tuple],
-        result: Dict[str, Any]
-    ) -> str:
-        """构建包含上传文件的任务提示"""
-        from .upload import FileUploader
-        
-        uploader = FileUploader()
+    def _build_file_prompt(self, task: str, files: List[tuple], result: Dict) -> str:
+        """构建包含文件信息的提示"""
+        file_descriptions = []
         uploaded_info = []
         
-        prompt = task + "\n\n"
-        prompt += "## 上传的文件\n\n"
-        
         for file_data, filename in files:
-            upload_result = uploader.upload(file_data, filename)
-            
-            if upload_result.success:
-                file = upload_result.file
-                prompt += f"### 文件: {file.filename}\n"
-                prompt += f"- 大小: {file.size} bytes\n"
-                prompt += f"- 类型: {file.content_type}\n\n"
-                
-                if file.parsed and file.parsed.is_valid:
-                    prompt += f"内容:\n{file.parsed.text}\n\n"
-                else:
-                    prompt += "[文件内容无法自动解析]\n\n"
-                
-                uploaded_info.append({
-                    "filename": file.filename,
-                    "size": file.size,
-                    "content_type": file.content_type
-                })
+            if isinstance(file_data, bytes):
+                try:
+                    content = file_data.decode('utf-8')
+                    preview = content[:500] + "..." if len(content) > 500 else content
+                    file_descriptions.append(f"- {filename}:\n```\n{preview}\n```")
+                except UnicodeDecodeError:
+                    file_descriptions.append(f"- {filename}: [二进制文件，大小: {len(file_data)} 字节]")
             else:
-                prompt += f"### 文件: {filename}\n"
-                prompt += f"[上传失败: {upload_result.error}]\n\n"
+                preview = str(file_data)[:500] + "..." if len(str(file_data)) > 500 else str(file_data)
+                file_descriptions.append(f"- {filename}:\n```\n{preview}\n```")
+            
+            uploaded_info.append({"name": filename, "size": len(file_data) if isinstance(file_data, bytes) else len(str(file_data))})
         
         result["uploaded_files"] = uploaded_info
-        return prompt
+        
+        return f"""用户上传了以下文件:
+
+{chr(10).join(file_descriptions)}
+
+文件已上传到沙盒目录: /home/daytona/workspace/
+可以使用 read_file 工具读取文件内容。
+
+任务: {task}
+
+请根据上传的文件内容完成用户的任务。"""
+    
+    def process_file(self, file_data: bytes, filename: str, task: str) -> Dict[str, Any]:
+        """
+        处理单个文件的便捷方法
+        
+        Args:
+            file_data: 文件数据
+            filename: 文件名
+            task: 任务描述
+        
+        Returns:
+            处理结果
+        """
+        return self.run(task, files=[(file_data, filename)])
+    
+    def process_files(self, files: List[tuple], task: str) -> Dict[str, Any]:
+        """
+        处理多个文件的便捷方法
+        
+        Args:
+            files: 文件列表 [(file_data, filename), ...]
+            task: 任务描述
+        
+        Returns:
+            处理结果
+        """
+        return self.run(task, files=files)
     
     def __enter__(self):
-        """上下文管理器入口"""
-        return self.initialize()
+        self.initialize()
+        return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """上下文管理器出口"""
         self._cleanup_sandbox()
-            
 
-
-
-def run_task(
-    task: str, 
-    config: Optional[CerebellumConfig] = None, 
-    debug: bool = False,
-    files: Optional[List[tuple]] = None
-) -> Dict[str, Any]:
-    """
-    快速运行任务的便捷函数
-    
-    Args:
-        task: 任务描述
-        config: 配置对象（可选）
-        debug: 是否启用调试模式
-        files: 可选，要上传处理的文件列表 [(file_data, filename), ...]
-    
-    Returns:
-        包含结果和文件信息的字典
-    """
-    with Cerebellum(config=config, debug=debug) as agent:
-        return agent.run(task, files=files)
-
-
-# 导入扩展模块
-from .security import FileSecurityChecker, SecurityCheckResult, check_file
-from .parser import FileParserManager, ParsedContent, parse_file
-from .upload import FileUploader, UploadResult, UploadedFile, upload_file
-from .plus import CerebellumPlus, process_file, process_files
 
 __all__ = [
-    # 核心类
     "Cerebellum",
     "CerebellumConfig",
+    "CacheConfig",
+    "ReflectionConfig",
+    "SandboxConfig",
     "FileData",
-    "run_task",
-    
-    # 文件处理
-    "FileSecurityChecker",
-    "SecurityCheckResult",
-    "check_file",
-    "FileParserManager", 
-    "ParsedContent",
-    "parse_file",
-    "FileUploader",
-    "UploadResult",
-    "UploadedFile",
-    "upload_file",
-    
-    # 增强版
-    "CerebellumPlus",
+    "SubTask",
+    "SubTaskStatus",
+    "TaskStatus",
+    "TaskResult",
+    "ReflectionHistory",
+    "CacheResult",
+    "CacheAction",
+    "DatabaseManager",
+    "TaskEncoder",
+    "SimilarityChecker",
+    "CacheManager",
+    "SandboxManager",
+    "ReflectionChainExecutor",
+    "TaskPlanner",
+    "TaskScheduler",
+    "TaskReporter",
     "process_file",
     "process_files",
 ]

@@ -1,0 +1,13 @@
+# 测试覆盖率
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+logs/
+docs/
+cdot.py
+doc.txt
+output/
+*.db
+pytest.ini
