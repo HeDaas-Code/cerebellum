@@ -38,10 +38,12 @@ class TaskPlanner:
     }
     
     SKILL_KEYWORDS: Dict[str, List[str]] = {
-        "chart": ["图表", "可视化", "绘制", "plot", "chart"],
-        "xlsx": ["excel", "表格", "数据", "xlsx", "csv"],
-        "pdf": ["pdf", "文档"],
-        "image": ["图片", "图像", "图片处理"],
+        "pdf": ["pdf", "文档", "报告", "report"],
+        "xlsx": ["excel", "表格", "数据", "xlsx", "csv", "spreadsheet"],
+        "docx": ["word", "文档", "docx", "document"],
+        "pptx": ["ppt", "演示", "幻灯片", "pptx", "presentation"],
+        "chart": ["图表", "可视化", "绘制", "plot", "chart", "graph", "图片"],
+        "image": ["图片", "图像", "图片处理", "image"],
         "web": ["网页", "网站", "web", "html"],
         "api": ["api", "接口", "请求"],
     }
@@ -171,7 +173,7 @@ class TaskPlanner:
         Returns:
             子任务ID到技能的映射
         """
-        logger.debug(f"匹配技能: {len(subtasks)} 个子任务, {len(available_skills)} 个技能")
+        logger.debug(f"匹配技能: {len(subtasks)} 个子任务, 可用技能: {available_skills}")
         skill_mapping = {}
         
         available_lower = [s.lower() for s in available_skills]
@@ -181,11 +183,12 @@ class TaskPlanner:
             
             for skill_pattern, keywords in self.SKILL_KEYWORDS.items():
                 for kw in keywords:
-                    if kw in subtask_text:
+                    if kw.lower() in subtask_text:
+                        # 直接匹配技能名称
                         for i, skill in enumerate(available_lower):
-                            if skill_pattern in skill:
+                            if skill_pattern == skill:
                                 skill_mapping[subtask.id] = available_skills[i]
-                                logger.debug(f"子任务 {subtask.name} 匹配技能: {available_skills[i]}")
+                                logger.debug(f"子任务 '{subtask.name}' 匹配技能: {available_skills[i]}")
                                 break
                         break
                 if subtask.id in skill_mapping:

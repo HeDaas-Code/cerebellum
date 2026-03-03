@@ -295,22 +295,15 @@ class Cerebellum:
             if specific_paths:
                 files = specific_paths
                 logger.info(f"使用指定的文件路径: {len(files)} 个")
-                # 列出工作目录文件用于调试
-                try:
-                    result = self.sandbox._process.exec("ls -la /home/daytona/workspace/", timeout=10)
-                    if result.stdout:
-                        logger.debug(f"沙盒工作目录文件:\n{result.stdout}")
-                except Exception as e:
-                    logger.debug(f"ls workspace 失败: {e}")
             else:
                 # 常规文件搜索
                 all_files = []
                 
                 try:
                     result = self.sandbox._process.exec("ls -la /home/daytona/workspace/", timeout=10)
-                    if result.stdout:
-                        logger.debug(f"沙盒工作目录文件:\n{result.stdout}")
-                        for line in result.stdout.strip().split('\n'):
+                    if hasattr(result, 'result') and result.result:
+                        logger.debug(f"沙盒工作目录文件:\n{result.result[:500]}")
+                        for line in result.result.strip().split('\n'):
                             if line.strip() and not line.startswith('total') and not line.startswith('drwxr'):
                                 file_name = line.split()[-1]
                                 all_files.append(f"/home/daytona/workspace/{file_name}")
@@ -322,9 +315,8 @@ class Cerebellum:
                         "find /home/daytona/workspace -type f 2>/dev/null",
                         timeout=15
                     )
-                    if result.stdout:
-                        logger.debug(f"find 命令结果:\n{result.stdout}")
-                        for line in result.stdout.strip().split('\n'):
+                    if hasattr(result, 'result') and result.result:
+                        for line in result.result.strip().split('\n'):
                             if line.strip() and line.strip() not in all_files:
                                 all_files.append(line.strip())
                 except Exception as e:
@@ -338,41 +330,38 @@ class Cerebellum:
                 return files_data
             
             logger.info(f"发现 {len(files)} 个文件")
+            valid_files = []
+            
+            # 先验证所有文件是否真实存在且有效
             for file_path in files:
+                file_name = Path(file_path).name
+                if file_name in downloaded_names:
+                    continue
+                
+                # 获取文件大小
+                file_size = self._get_file_size(file_path)
+                if file_size <= 0:
+                    logger.warning(f"文件不存在或为空: {file_path}")
+                    continue
+                
+                valid_files.append((file_path, file_name, file_size))
+            
+            logger.info(f"有效文件: {len(valid_files)} 个")
+            
+            for file_path, file_name, file_size in valid_files:
                 try:
-                    file_name = Path(file_path).name
+                    logger.debug(f"下载文件: {file_name} (大小: {file_size} 字节)")
                     
-                    if file_name in downloaded_names:
+                    # 根据文件类型选择下载方式
+                    content = self._download_file_with_retry(file_path, file_name)
+                    
+                    if not content or len(content) < 10:
+                        logger.warning(f"文件内容无效: {file_name} (下载大小: {len(content) if content else 0} 字节)")
                         continue
                     
-                    # 跳过文件存在检查，直接尝试读取
-                    
-                    if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')):
-                        from base64 import b64decode
-                        logger.debug(f"正在下载图片: {file_path}")
-                        b64_result = self.sandbox._process.exec(f"base64 -w0 '{file_path}'", timeout=30)
-                        # 处理 ExecuteResponse 对象 - 使用 result 属性
-                        if hasattr(b64_result, 'result'):
-                            bstdout = b64_result.result
-                        else:
-                            bstdout = str(b64_result)
-                        # 确保 bstdout 是字符串
-                        if not isinstance(bstdout, str):
-                            bstdout = str(bstdout)
-                        content = b64decode(bstdout.strip()) if bstdout.strip() else b""
-                        logger.debug(f"下载完成: {len(content)} 字节")
-                    else:
-                        content_result = self.sandbox._process.exec(f"cat '{file_path}'", timeout=30)
-                        if hasattr(content_result, 'result'):
-                            content = content_result.result
-                        else:
-                            content = str(content_result)
-                        # 确保 content 是字节
-                        if isinstance(content, str):
-                            content = content.encode('utf-8')
-                    
-                    if not content:
-                        logger.warning(f"文件内容为空: {file_name}")
+                    # 验证文件内容
+                    if not self._validate_file_content(file_name, content):
+                        logger.warning(f"文件验证失败: {file_name}")
                         continue
                     
                     files_data.append(FileData(
@@ -391,6 +380,120 @@ class Cerebellum:
             logger.error(f"获取文件失败: {e}")
         
         return files_data
+    
+    def _get_file_size(self, file_path: str) -> int:
+        """获取沙盒中文件的大小"""
+        try:
+            result = self.sandbox._process.exec(f"stat -c%s '{file_path}' 2>/dev/null || wc -c < '{file_path}'", timeout=10)
+            if hasattr(result, 'result') and result.result:
+                return int(result.result.strip().split()[0])
+        except Exception:
+            pass
+        return 0
+    
+    def _download_file_with_retry(self, file_path: str, file_name: str) -> bytes:
+        """使用多种方法下载文件，带重试机制"""
+        content = b""
+        
+        # 方法1: 使用 base64 编码（推荐用于二进制文件）
+        if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.zip')):
+            content = self._download_via_base64(file_path)
+            if content and len(content) > 100:
+                logger.debug(f"base64 方法下载成功: {len(content)} 字节")
+                return content
+            logger.debug(f"base64 方法失败，尝试其他方法...")
+        
+        # 方法2: 使用 Python 读取并 base64 编码
+        content = self._download_via_python(file_path)
+        if content and len(content) > 100:
+            logger.debug(f"Python 方法下载成功: {len(content)} 字节")
+            return content
+        
+        # 方法3: 使用 cat 命令（仅适用于文本文件）
+        if file_name.endswith(('.txt', '.md', '.csv', '.json')):
+            content = self._download_via_cat(file_path)
+            if content:
+                logger.debug(f"cat 方法下载成功: {len(content)} 字节")
+                return content
+        
+        return content
+    
+    def _download_via_base64(self, file_path: str) -> bytes:
+        """通过 base64 命令下载文件"""
+        try:
+            from base64 import b64decode
+            result = self.sandbox._process.exec(f"base64 -w0 '{file_path}'", timeout=60)
+            if hasattr(result, 'result') and result.result:
+                b64_data = result.result.strip()
+                # 检查 base64 数据是否有效
+                if len(b64_data) < 10:
+                    return b""
+                # 补齐 padding
+                padding = 4 - len(b64_data) % 4
+                if padding != 4:
+                    b64_data += '=' * padding
+                return b64decode(b64_data)
+        except Exception as e:
+            logger.debug(f"base64 下载失败: {e}")
+        return b""
+    
+    def _download_via_python(self, file_path: str) -> bytes:
+        """通过 Python 脚本下载文件"""
+        try:
+            import base64
+            python_code = f'''
+import base64
+with open("{file_path}", "rb") as f:
+    data = f.read()
+print(base64.b64encode(data).decode('ascii'))
+'''
+            result = self.sandbox._process.exec(f"python3 -c '{python_code}'", timeout=60)
+            if hasattr(result, 'result') and result.result:
+                b64_data = result.result.strip()
+                if len(b64_data) < 10:
+                    return b""
+                return base64.b64decode(b64_data)
+        except Exception as e:
+            logger.debug(f"Python 下载失败: {e}")
+        return b""
+    
+    def _download_via_cat(self, file_path: str) -> bytes:
+        """通过 cat 命令下载文本文件"""
+        try:
+            result = self.sandbox._process.exec(f"cat '{file_path}'", timeout=60)
+            if hasattr(result, 'result') and result.result:
+                return result.result.encode('utf-8')
+        except Exception as e:
+            logger.debug(f"cat 下载失败: {e}")
+        return b""
+    
+    def _validate_file_content(self, file_name: str, content: bytes) -> bool:
+        """验证文件内容是否有效"""
+        if not content or len(content) < 10:
+            return False
+        
+        # 检查文件魔数（签名）
+        if file_name.endswith('.png'):
+            return content[:8] == b'\x89PNG\r\n\x1a\n'
+        elif file_name.endswith(('.jpg', '.jpeg')):
+            return content[:2] == b'\xff\xd8'
+        elif file_name.endswith('.pdf'):
+            return content[:4] == b'%PDF'
+        elif file_name.endswith('.zip'):
+            return content[:4] == b'PK\x03\x04'
+        elif file_name.endswith('.xlsx'):
+            # xlsx 实际上是 zip 格式
+            return content[:4] == b'PK\x03\x04'
+        
+        # 文本文件检查
+        if file_name.endswith(('.txt', '.md', '.csv', '.json')):
+            try:
+                content.decode('utf-8')
+                return True
+            except UnicodeDecodeError:
+                return False
+        
+        return True
     
     def _cleanup_sandbox(self):
         """清理沙盒资源"""
@@ -430,6 +533,40 @@ class Cerebellum:
 | **数据/表格** | 数据、表格、CSV、Excel | 在沙盒中生成数据文件 |
 | **文本内容** | 文本、文字、内容 | 如果简单直接返回；如果复杂生成文件返回 |
 | **执行结果** | 运行、执行、计算结果 | 在沙盒中执行代码 |
+
+### 图片生成最佳实践（重要！）
+生成图片时必须遵循以下步骤：
+
+1. **使用 matplotlib 生成图片**：
+```python
+import matplotlib.pyplot as plt
+# 设置中文字体（如果需要）
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # 使用英文字体避免乱码
+plt.rcParams['axes.unicode_minus'] = False
+
+# 创建图表
+fig, ax = plt.subplots(figsize=(10, 6))
+# ... 绑定数据 ...
+
+# 保存图片（必须使用 savefig）
+plt.savefig('/home/daytona/workspace/chart_name.png', dpi=150, bbox_inches='tight')
+plt.close()  # 关闭图形释放内存
+```
+
+2. **验证图片已生成**：
+```python
+import os
+file_path = '/home/daytona/workspace/chart_name.png'
+if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+    print(f"图片已成功生成: {file_path}, 大小: {os.path.getsize(file_path)} 字节")
+else:
+    print("图片生成失败！")
+```
+
+3. **注意事项**：
+- 必须使用 `plt.savefig()` 保存图片，不能只使用 `plt.show()`
+- 图片路径必须是 `/home/daytona/workspace/` 目录下
+- 生成后必须验证文件存在且大小大于 0
 
 ### 关键原则
 - **用户要什么就给什么**：如果用户说要图片，你就给图片文件
@@ -601,11 +738,11 @@ class Cerebellum:
             {
                 "success": True,
                 "message": "处理结果...",
-                "files": [
-                    {"name": "file.txt", "content": "文件内容", "type": "text"},
-                    {"name": "image.png", "content": b"...", "type": "image/png"}
-                ],
-                "uploaded_files": [...]  # 上传的文件信息（如果有）
+                "files": [...],
+                "uploaded_files": [...],
+                "subtasks": [...],
+                "skills_used": [...],
+                "reflection_chains": [...]
             }
         """
         if self.agent is None:
@@ -620,7 +757,8 @@ class Cerebellum:
             "files": [],
             "uploaded_files": [],
             "subtasks": [],
-            "skills_used": []
+            "skills_used": [],
+            "reflection_chains": []
         }
         
         cache_result = self._check_cache(task, files)
@@ -645,19 +783,19 @@ class Cerebellum:
                         logger.warning(f"上传失败: {filename}")
         
         try:
-            logger.info("=" * 50)
-            logger.info("阶段 1: 任务规划")
-            logger.info("=" * 50)
+            logger.info("=" * 60)
+            logger.info("【任务规划器】阶段 1: 分析与拆分")
+            logger.info("=" * 60)
             
             intent, expected_outputs = self.planner.analyze_intent(task)
-            logger.info(f"任务意图: {intent}")
-            logger.info(f"预期输出: {expected_outputs}")
+            logger.info(f"[任务规划器] 意图分析: {intent}")
+            logger.info(f"[任务规划器] 预期输出类型: {expected_outputs}")
             
             files_info = [f[1] for f in files] if files else None
             subtasks = self.planner.split_task(task, files_info)
             
             if subtasks:
-                logger.info(f"任务拆分为 {len(subtasks)} 个子任务:")
+                logger.info(f"[任务规划器] 任务拆分为 {len(subtasks)} 个子任务:")
                 for i, st in enumerate(subtasks, 1):
                     deps = f" (依赖: {', '.join(st.dependencies)})" if st.dependencies else ""
                     logger.info(f"  {i}. [{st.priority}] {st.name}{deps}")
@@ -666,34 +804,60 @@ class Cerebellum:
                     for st in subtasks
                 ]
             
-            available_skills = list(self.skills_files.keys()) if self.skills_files else []
+            # 提取技能名称（而不是文件路径）
+            skill_names = set()
+            for skill_path in self.skills_files.keys():
+                # 从路径中提取技能名称: /skills/pdf/SKILL.md -> pdf
+                parts = skill_path.split("/")
+                if len(parts) >= 3 and parts[1] == "skills":
+                    skill_names.add(parts[2])
+            
+            available_skills = list(skill_names)
+            skill_mapping = {}
             if available_skills:
-                logger.info(f"可用技能: {len(available_skills)} 个")
+                logger.info(f"[任务规划器] 可用技能: {available_skills}")
                 skill_mapping = self.planner.match_skills(subtasks, available_skills)
                 if skill_mapping:
-                    logger.info("技能匹配结果:")
+                    logger.info("[任务规划器] 技能匹配结果:")
                     for st_id, skill in skill_mapping.items():
                         st = next((s for s in subtasks if s.id == st_id), None)
                         if st:
                             logger.info(f"  - {st.name} -> {skill}")
                         result["skills_used"].append(skill)
             
-            logger.info("=" * 50)
-            logger.info("阶段 2: 任务执行")
-            logger.info("=" * 50)
+            logger.info("=" * 60)
+            logger.info("【智能体执行】阶段 2: 任务执行")
+            logger.info("=" * 60)
+            
+            # 显示技能使用提示
+            if result["skills_used"]:
+                unique_skills = list(set(result["skills_used"]))
+                logger.info(f"[智能体] 已加载技能: {unique_skills}")
+                logger.info(f"[智能体] 技能文件已注入到智能体上下文中，智能体可以直接参考这些技能知识")
             
             task_prompt = task
             if files:
                 task_prompt = self._build_file_prompt(task, files, result)
             
+            # 构建技能提示
             skill_hints = ""
             if result["skills_used"]:
-                skill_hints = f"\n\n可用技能: {', '.join(set(result['skills_used'][:5]))}\n可以通过 skills 工具调用这些技能来完成任务。"
+                unique_skills = list(set(result["skills_used"][:5]))
+                logger.info(f"[任务规划器] 推荐技能: {unique_skills}")
+                skill_hints = f"""
+
+【可用技能】以下技能可以帮助你完成任务:
+{chr(10).join([f'- {s}' for s in unique_skills])}
+
+请使用 skills 工具调用这些技能。例如:
+- 处理 PDF 文件: 使用 pdf 技能
+- 处理 Excel 文件: 使用 xlsx 技能
+- 创建 Word 文档: 使用 docx 技能
+- 创建 PPT 演示: 使用 pptx 技能
+"""
             
             enhanced_prompt = f"""{task_prompt}
-
 {skill_hints}
-
 请按照以下步骤执行:
 1. 分析任务需求
 2. 选择合适的工具和技能
@@ -705,73 +869,224 @@ class Cerebellum:
             agent_result = None
             agent_error = None
             step_count = 0
+            reflection_count = 0
+            max_reflections = 10
             
-            try:
-                for event in self.agent.stream(
-                    {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": enhanced_prompt
-                            }
-                        ],
-                        "files": self.skills_files
-                    },
-                    stream_mode="values"
-                ):
-                    if event:
+            def execute_with_reflection(prompt_messages, current_step=0):
+                """带反思链中断的执行函数"""
+                nonlocal agent_result, agent_error, step_count, reflection_count
+                
+                try:
+                    for event in self.agent.stream(
+                        {"messages": prompt_messages, "files": self.skills_files},
+                        stream_mode="values"
+                    ):
+                        if not event:
+                            continue
+                        
                         step_count += 1
-                        if "messages" in event:
-                            msgs = event["messages"]
-                            if msgs:
-                                last_msg = msgs[-1]
-                                msg_type = type(last_msg).__name__
-                                content = ""
-                                if hasattr(last_msg, "content"):
-                                    content = str(last_msg.content)[:150] if last_msg.content else ""
+                        if "messages" not in event:
+                            continue
+                            
+                        msgs = event["messages"]
+                        if not msgs:
+                            continue
+                        
+                        last_msg = msgs[-1]
+                        msg_type = type(last_msg).__name__
+                        content = ""
+                        if hasattr(last_msg, "content"):
+                            content = str(last_msg.content)[:150] if last_msg.content else ""
+                        
+                        if msg_type == "AIMessage" and content.strip():
+                            if "tool_calls" in last_msg.additional_kwargs:
+                                tool_calls = last_msg.additional_kwargs["tool_calls"]
+                                if tool_calls:
+                                    for tc in tool_calls:
+                                        func_name = tc.get("function", {}).get("name", "unknown")
+                                        func_args = tc.get("function", {}).get("arguments", "{}")
+                                        
+                                        # 检测技能调用
+                                        if func_name == "skills" or "skill" in func_name.lower():
+                                            logger.info(f"[智能体] 步骤 {step_count}: 【技能调用】{func_name}")
+                                            try:
+                                                import json
+                                                args = json.loads(func_args) if isinstance(func_args, str) else func_args
+                                                if args:
+                                                    logger.info(f"[智能体] 技能参数: {args}")
+                                            except Exception:
+                                                pass
+                                        else:
+                                            logger.info(f"[智能体] 步骤 {step_count}: 调用工具 {func_name}")
+                            elif content.strip():
+                                logger.info(f"[智能体] 步骤 {step_count}: {content}...")
+                        
+                        elif msg_type == "ToolMessage":
+                            tool_name = getattr(last_msg, 'name', 'unknown')
+                            tool_content = str(last_msg.content)[:500] if last_msg.content else ""
+                            
+                            if ("Error" in tool_content or "error" in tool_content or 
+                                "失败" in tool_content or "Exception" in tool_content):
                                 
-                                if msg_type == "AIMessage" and content.strip():
-                                    if "tool_calls" in last_msg.additional_kwargs:
-                                        tool_calls = last_msg.additional_kwargs["tool_calls"]
-                                        if tool_calls:
-                                            for tc in tool_calls:
-                                                func_name = tc.get("function", {}).get("name", "unknown")
-                                                logger.info(f"[步骤 {step_count}] 调用工具: {func_name}")
-                                    elif content.strip():
-                                        logger.info(f"[步骤 {step_count}] AI: {content}...")
-                                elif msg_type == "ToolMessage":
-                                    tool_name = getattr(last_msg, 'name', 'unknown')
-                                    tool_content = str(last_msg.content)[:200] if last_msg.content else ""
-                                    logger.info(f"[步骤 {step_count}] 工具返回 [{tool_name}]: {tool_content}...")
-                
-                agent_result = event if event else None
-                
-            except Exception as e:
-                agent_error = e
-                logger.error(f"Stream 错误: {type(e).__name__}: {e}")
+                                logger.warning(f"[智能体] 步骤 {step_count}: 工具 {tool_name} 返回错误")
+                                
+                                if self.reflection_executor and reflection_count < max_reflections:
+                                    reflection_count += 1
+                                    
+                                    logger.info("=" * 60)
+                                    logger.info(f"【反思链】中断执行，开始错误分析与修复 (第 {reflection_count} 次)")
+                                    logger.info("=" * 60)
+                                    logger.info(f"[反思链] 错误来源: {tool_name}")
+                                    logger.debug(f"[反思链] 错误详情: {tool_content[:200]}...")
+                                    
+                                    chain = self.reflection_executor.execute_chain(
+                                        error_message=tool_content,
+                                        context={
+                                            "tool": tool_name,
+                                            "step": step_count,
+                                            "task": task,
+                                            "subtasks": [{"id": st.id, "name": st.name} for st in subtasks] if subtasks else []
+                                        },
+                                        chain_number=reflection_count,
+                                        previous_chains=result["reflection_chains"]
+                                    )
+                                    
+                                    result["reflection_chains"].append({
+                                        "chain_id": chain.chain_id,
+                                        "chain_number": chain.chain_number,
+                                        "error": chain.error_message[:200],
+                                        "problem": chain.problem_identified,
+                                        "solution": chain.proposed_solution,
+                                        "success": chain.is_success
+                                    })
+                                    
+                                    if chain.is_success:
+                                        logger.success(f"[反思链] 修复成功: {chain.result_message}")
+                                        
+                                        # 如果反思链生成了可执行代码，先执行它
+                                        if chain.solution_code:
+                                            logger.info(f"[反思链] 执行解决方案代码...")
+                                            try:
+                                                exec_result = self.sandbox._process.exec(chain.solution_code, timeout=60)
+                                                if hasattr(exec_result, 'result'):
+                                                    logger.debug(f"[反思链] 执行结果: {exec_result.result[:200] if exec_result.result else '无输出'}")
+                                                logger.success(f"[反思链] 解决方案代码执行完成")
+                                            except Exception as exec_err:
+                                                logger.warning(f"[反思链] 解决方案代码执行失败: {exec_err}")
+                                        
+                                        logger.info("[反思链] 恢复任务执行...")
+                                        
+                                        recovery_prompt = f"""【反思链修复完成】
+
+问题: {chain.problem_identified}
+根本原因: {chain.root_cause}
+解决方案: {chain.proposed_solution}
+
+请继续执行任务。如果之前有失败的步骤，请根据上述解决方案重新尝试。"""
+                                        
+                                        new_messages = prompt_messages + [
+                                            {"role": "user", "content": recovery_prompt}
+                                        ]
+                                        return execute_with_reflection(new_messages, step_count)
+                                    else:
+                                        logger.warning(f"[反思链] 修复失败: {chain.result_message}")
+                                else:
+                                    logger.warning(f"[反思链] 已达到最大反思次数 ({max_reflections})，继续执行")
+                            else:
+                                logger.info(f"[智能体] 步骤 {step_count}: 工具 {tool_name} 返回成功")
+                    
+                    return event
+                    
+                except Exception as e:
+                    agent_error = e
+                    logger.error(f"[智能体] 执行错误: {type(e).__name__}: {e}")
+                    
+                    if self.reflection_executor and reflection_count < max_reflections:
+                        reflection_count += 1
+                        
+                        logger.info("=" * 60)
+                        logger.info(f"【反思链】中断执行，开始错误分析与修复 (第 {reflection_count} 次)")
+                        logger.info("=" * 60)
+                        logger.info(f"[反思链] 错误类型: {type(e).__name__}")
+                        
+                        chain = self.reflection_executor.execute_chain(
+                            error_message=str(e),
+                            context={
+                                "tool": "agent",
+                                "step": step_count,
+                                "task": task,
+                                "exception_type": type(e).__name__,
+                                "subtasks": [{"id": st.id, "name": st.name} for st in subtasks] if subtasks else []
+                            },
+                            chain_number=reflection_count,
+                            previous_chains=result["reflection_chains"]
+                        )
+                        
+                        result["reflection_chains"].append({
+                            "chain_id": chain.chain_id,
+                            "chain_number": chain.chain_number,
+                            "error": chain.error_message[:200],
+                            "problem": chain.problem_identified,
+                            "solution": chain.proposed_solution,
+                            "success": chain.is_success
+                        })
+                        
+                        if chain.is_success:
+                            logger.success(f"[反思链] 修复成功: {chain.result_message}")
+                            
+                            # 如果反思链生成了可执行代码，先执行它
+                            if chain.solution_code:
+                                logger.info(f"[反思链] 执行解决方案代码...")
+                                try:
+                                    exec_result = self.sandbox._process.exec(chain.solution_code, timeout=60)
+                                    if hasattr(exec_result, 'result'):
+                                        logger.debug(f"[反思链] 执行结果: {exec_result.result[:200] if exec_result.result else '无输出'}")
+                                    logger.success(f"[反思链] 解决方案代码执行完成")
+                                except Exception as exec_err:
+                                    logger.warning(f"[反思链] 解决方案代码执行失败: {exec_err}")
+                            
+                            logger.info("[反思链] 恢复任务执行...")
+                            
+                            recovery_prompt = f"""【反思链修复完成】
+
+异常: {type(e).__name__}: {str(e)}
+问题: {chain.problem_identified}
+根本原因: {chain.root_cause}
+解决方案: {chain.proposed_solution}
+
+请继续执行任务。如果之前有失败的步骤，请根据上述解决方案重新尝试。"""
+                            
+                            new_messages = [
+                                {"role": "user", "content": enhanced_prompt},
+                                {"role": "user", "content": recovery_prompt}
+                            ]
+                            return execute_with_reflection(new_messages, step_count)
+                    
+                    return None
             
-            if agent_error:
+            agent_result = execute_with_reflection([{"role": "user", "content": enhanced_prompt}])
+            
+            if agent_error and not result["reflection_chains"]:
                 raise agent_error
             
-            logger.info("=" * 50)
-            logger.info("阶段 3: 结果收集")
-            logger.info("=" * 50)
+            logger.info("=" * 60)
+            logger.info("【结果收集】阶段 3: 文件下载与验证")
+            logger.info("=" * 60)
             
             if agent_result and "messages" in agent_result:
                 last_message = agent_result["messages"][-1]
                 result["message"] = last_message.content if hasattr(last_message, 'content') else str(last_message)
-                logger.info("任务处理完成")
+                logger.info("[结果收集] 任务处理完成")
                 result["success"] = True
             else:
-                logger.warning(f"Agent 返回异常: {agent_result}")
+                logger.warning(f"[结果收集] Agent 返回异常")
                 result["message"] = "Agent 未返回有效结果"
             
-            # 从智能体回复中提取文件路径
             file_paths_from_message = self._extract_file_paths(result["message"])
             if file_paths_from_message:
-                logger.info(f"从智能体回复中提取到 {len(file_paths_from_message)} 个文件路径")
+                logger.info(f"[结果收集] 从智能体回复中提取到 {len(file_paths_from_message)} 个文件路径")
                 for path in file_paths_from_message:
-                    logger.info(f"  - {path}")
+                    logger.debug(f"  - {path}")
             
             downloaded_files = self._download_files_from_sandbox(file_paths_from_message)
             if downloaded_files:
@@ -779,7 +1094,13 @@ class Cerebellum:
                     {"name": f.name, "content": f.content, "type": f.type}
                     for f in downloaded_files
                 ]
-                logger.info(f"已获取 {len(downloaded_files)} 个文件")
+                logger.info(f"[结果收集] 已下载 {len(downloaded_files)} 个文件")
+                
+                for f in downloaded_files:
+                    if self._validate_file_content(f.name, f.content):
+                        logger.success(f"[结果收集] 文件验证通过: {f.name} ({len(f.content)} 字节)")
+                    else:
+                        logger.warning(f"[结果收集] 文件验证失败: {f.name}")
             
             if result["success"]:
                 self._store_cache(task, result["message"], downloaded_files)
