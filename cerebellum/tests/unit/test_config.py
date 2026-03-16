@@ -8,7 +8,7 @@ import pytest
 from pathlib import Path
 
 from cerebellum.config import (
-    CerebellumConfig, CacheConfig, ReflectionConfig, SandboxConfig
+    CerebellumConfig, CacheConfig, ReflectionConfig, SandboxConfig, LLMBackend
 )
 
 
@@ -81,21 +81,21 @@ class TestCerebellumConfig:
         """测试默认值"""
         config = CerebellumConfig()
         
-        assert config.dashscope_api_key == ""
-        assert config.dashscope_model == "glm-5"
+        assert config.api_key == ""
+        assert config.model == "glm-5"
         assert config.debug is False
         assert config.skills_dir is None
     
     def test_custom_values(self):
         """测试自定义值"""
         config = CerebellumConfig(
-            dashscope_api_key="test-key",
-            dashscope_model="custom-model",
+            api_key="test-key",
+            model="custom-model",
             debug=True
         )
         
-        assert config.dashscope_api_key == "test-key"
-        assert config.dashscope_model == "custom-model"
+        assert config.api_key == "test-key"
+        assert config.model == "custom-model"
         assert config.debug is True
     
     def test_default_database_path(self):
@@ -140,12 +140,12 @@ class TestCerebellumConfig:
     def test_api_keys(self):
         """测试 API 密钥配置"""
         config = CerebellumConfig(
-            dashscope_api_key="dash-key",
+            api_key="dash-key",
             daytona_api_key="daytona-key",
             tavily_api_key="tavily-key"
         )
         
-        assert config.dashscope_api_key == "dash-key"
+        assert config.api_key == "dash-key"
         assert config.daytona_api_key == "daytona-key"
         assert config.tavily_api_key == "tavily-key"
     
@@ -153,4 +153,17 @@ class TestCerebellumConfig:
         """测试默认 Base URL"""
         config = CerebellumConfig()
         
-        assert "dashscope" in config.dashscope_base_url
+        assert "dashscope" in config.base_url
+    
+    def test_minimax_backend(self):
+        """测试 MiniMax 后端配置"""
+        config = CerebellumConfig(llm_backend=LLMBackend.MINIMAX)
+        
+        assert "minimaxi" in config.base_url
+        assert config.model == "MiniMax-M2.5"
+    
+    def test_anthropic_backend(self):
+        """测试 Anthropic 后端配置"""
+        config = CerebellumConfig(llm_backend=LLMBackend.ANTHROPIC)
+        
+        assert "anthropic" in config.base_url

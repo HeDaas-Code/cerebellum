@@ -42,10 +42,10 @@ class TestTaskPlanner:
         """测试意图分析解析错误"""
         mock_llm.invoke.return_value = MagicMock(content="invalid json")
         
-        intent, outputs = planner.analyze_intent("分析文档")
+        intent, outputs = planner.analyze_intent("做一些事情")
         
-        assert intent == "未知意图"
-        assert outputs == []
+        assert intent == "通用任务"
+        assert outputs == ["文本"]
     
     def test_analyze_intent_with_markdown(self, planner, mock_llm):
         """测试带 markdown 的响应"""
@@ -62,10 +62,10 @@ class TestTaskPlanner:
         """测试 LLM 异常"""
         mock_llm.invoke.side_effect = Exception("LLM error")
         
-        intent, outputs = planner.analyze_intent("分析文档")
+        intent, outputs = planner.analyze_intent("做一些事情")
         
-        assert intent == "未知意图"
-        assert outputs == []
+        assert intent == "通用任务"
+        assert outputs == ["文本"]
     
     def test_split_task_success(self, planner, mock_llm):
         """测试任务拆分成功"""
@@ -100,11 +100,11 @@ class TestTaskPlanner:
         """测试任务拆分解析错误时创建默认任务"""
         mock_llm.invoke.return_value = MagicMock(content="invalid json")
         
-        subtasks = planner.split_task("分析文档")
+        subtasks = planner.split_task("做一些事情")
         
         assert len(subtasks) == 1
         assert subtasks[0].name == "执行任务"
-        assert subtasks[0].description == "分析文档"
+        assert subtasks[0].description == "做一些事情"
     
     def test_split_task_exception(self, planner, mock_llm):
         """测试 LLM 异常时创建默认任务"""

@@ -497,6 +497,25 @@ class ReflectionChainExecutor:
         except Exception:
             return [problem]
     
+    def _build_solution(
+        self,
+        chain: ReflectionChain,
+        context: Dict[str, Any],
+        previous_chains: list = None
+    ) -> tuple:
+        """
+        构建解决方案（_build_solution_with_search 的别名）
+        
+        Args:
+            chain: 反思链
+            context: 上下文
+            previous_chains: 之前的反思链记录
+        
+        Returns:
+            (root_cause, solution, code)
+        """
+        return self._build_solution_with_search(chain, context, previous_chains)
+    
     def _build_solution_with_search(
         self, 
         chain: ReflectionChain, 
