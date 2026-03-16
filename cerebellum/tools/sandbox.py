@@ -39,6 +39,30 @@ class SandboxManager:
     4. 支持自定义沙盒环境配置
     """
     
+    # 技能名称到 pip 依赖的映射
+    SKILL_DEPENDENCIES = {
+        "pdf": ["reportlab", "PyPDF2"],
+        "xlsx": ["openpyxl", "pandas"],
+        "docx": ["python-docx"],
+        "pptx": ["python-pptx"],
+        "chart": ["matplotlib", "seaborn", "pandas"],
+        "chart-creator": ["matplotlib", "seaborn", "pandas", "numpy"],
+        "image": ["Pillow"],
+        "web": ["requests", "beautifulsoup4"],
+        "api": ["requests", "httpx"],
+        "csv": ["pandas"],
+        "data-analysis": ["pandas", "numpy", "scipy"],
+    }
+    
+    # import 名到 pip 包名的映射（仅包含不同名的）
+    IMPORT_TO_PACKAGE = {
+        "PIL": "Pillow",
+        "bs4": "beautifulsoup4",
+        "docx": "python-docx",
+        "pptx": "python-pptx",
+        "sklearn": "scikit-learn",
+    }
+    
     def __init__(self, api_key: str, config: Optional[SandboxConfig] = None):
         """
         初始化沙盒管理器
@@ -276,22 +300,7 @@ class SandboxManager:
             self._logger.warning("沙盒未创建，无法配置")
             return
         
-        # 根据技能名称推断依赖
-        skill_dependencies = {
-            "pdf": ["reportlab", "PyPDF2"],
-            "xlsx": ["openpyxl", "pandas"],
-            "docx": ["python-docx"],
-            "pptx": ["python-pptx"],
-            "chart": ["matplotlib", "seaborn", "pandas"],
-            "chart-creator": ["matplotlib", "seaborn", "pandas", "numpy"],
-            "image": ["Pillow"],
-            "web": ["requests", "beautifulsoup4"],
-            "api": ["requests", "httpx"],
-            "csv": ["pandas"],
-            "data-analysis": ["pandas", "numpy", "scipy"],
-        }
-        
-        packages = skill_dependencies.get(skill_name, [])
+        packages = list(self.SKILL_DEPENDENCIES.get(skill_name, []))
         
         # 如果有技能内容，从中提取依赖
         if skill_content:
@@ -303,25 +312,10 @@ class SandboxManager:
                     if pkg and pkg not in packages:
                         packages.append(pkg)
             
-            # 查找 import 语句推断依赖
+            # 查找 import 语句推断依赖（仅不同名的映射）
             import_matches = re.findall(r'import\s+([\w]+)', skill_content)
-            import_map = {
-                "matplotlib": "matplotlib",
-                "seaborn": "seaborn",
-                "pandas": "pandas",
-                "numpy": "numpy",
-                "openpyxl": "openpyxl",
-                "PIL": "Pillow",
-                "reportlab": "reportlab",
-                "docx": "python-docx",
-                "pptx": "python-pptx",
-                "requests": "requests",
-                "bs4": "beautifulsoup4",
-                "scipy": "scipy",
-                "sklearn": "scikit-learn",
-            }
             for imp in import_matches:
-                pkg = import_map.get(imp)
+                pkg = self.IMPORT_TO_PACKAGE.get(imp)
                 if pkg and pkg not in packages:
                     packages.append(pkg)
         

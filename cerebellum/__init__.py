@@ -78,6 +78,51 @@ from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter
 
 DEFAULT_SKILLS_DIR = Path(__file__).parent / "skills"
 
+# 支持的文件扩展名（用于文件路径提取和下载）
+VALID_FILE_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
+    '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
+    '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
+    '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
+}
+
+# 安全的沙盒路径前缀
+SAFE_PATH_PREFIXES = ('/home/daytona/workspace/', '/tmp/')
+
+
+def extract_llm_content(response) -> str:
+    """
+    统一提取 LLM 响应内容（兼容所有后端格式）
+    
+    处理字符串、列表格式（Anthropic 兼容）等多种内容格式
+    
+    Args:
+        response: LLM 响应对象或内容
+    
+    Returns:
+        提取的文本内容
+    """
+    content = response
+    if hasattr(response, 'content'):
+        content = response.content
+    
+    if isinstance(content, str):
+        return content
+    
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get('type') == 'text':
+                    text_parts.append(block.get('text', ''))
+                elif 'text' in block:
+                    text_parts.append(block['text'])
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return '\n'.join(text_parts)
+    
+    return str(content) if content else ""
+
 
 class Cerebellum:
     """
@@ -324,18 +369,11 @@ class Cerebellum:
     def _extract_file_paths(self, message: str) -> List[str]:
         """从智能体回复中提取文件路径"""
         import re
+        import os.path
         file_paths = []
         
-        # 支持的文件扩展名
-        valid_extensions = {
-            '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
-            '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
-            '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
-            '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
-        }
-        
-        # 匹配文件路径的正则表达式（更宽泛以支持多种路径格式）
-        ext_pattern = '|'.join(ext.lstrip('.') for ext in valid_extensions)
+        # 匹配文件路径的正则表达式
+        ext_pattern = '|'.join(ext.lstrip('.') for ext in VALID_FILE_EXTENSIONS)
         patterns = [
             rf'/home/daytona/workspace/[\w\-\./]+\.(?:{ext_pattern})',  # 完整路径（含子目录）
             rf'/tmp/[\w\-\./]+\.(?:{ext_pattern})',  # /tmp 目录
@@ -355,11 +393,15 @@ class Cerebellum:
                         if cleaned_path:
                             file_paths.append(cleaned_path)
         
-        # 过滤无效路径
+        # 过滤无效路径并防止路径遍历攻击
         valid_paths = []
         for path in file_paths:
-            if any(path.lower().endswith(ext) for ext in valid_extensions):
-                valid_paths.append(path)
+            if not any(path.lower().endswith(ext) for ext in VALID_FILE_EXTENSIONS):
+                continue
+            # 规范化路径并确保在安全目录内
+            normalized = os.path.normpath(path)
+            if any(normalized.startswith(prefix) for prefix in SAFE_PATH_PREFIXES):
+                valid_paths.append(normalized)
         
         # 去重（保持顺序）
         seen = set()
@@ -414,13 +456,8 @@ class Cerebellum:
                 except Exception as e:
                     logger.debug(f"find 失败: {e}")
                 
-                valid_extensions = (
-                    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
-                    '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
-                    '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
-                    '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
-                )
-                files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+                valid_ext_tuple = tuple(VALID_FILE_EXTENSIONS)
+                files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_ext_tuple)]
             
             if not files:
                 logger.info("未发现有效文件")
@@ -1382,6 +1419,8 @@ __all__ = [
     "TaskPlanner",
     "TaskScheduler",
     "TaskReporter",
+    "VALID_FILE_EXTENSIONS",
+    "extract_llm_content",
     "process_file",
     "process_files",
 ]

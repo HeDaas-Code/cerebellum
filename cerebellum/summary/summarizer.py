@@ -11,6 +11,9 @@ from datetime import datetime
 
 from ..utils import logger
 
+# LLM 提示中反思链文本的最大字符数
+MAX_CHAINS_TEXT_LENGTH = 3000
+
 
 @dataclass
 class PathConstraint:
@@ -274,7 +277,7 @@ class WorkflowSummarizer:
 执行结果: {"成功" if success else "失败"}
 
 反思链记录:
-{chains_text[:3000]}
+{chains_text[:MAX_CHAINS_TEXT_LENGTH]}
 
 请提取约束，返回 JSON 数组:
 [
