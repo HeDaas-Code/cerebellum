@@ -167,3 +167,40 @@ class TestCerebellumConfig:
         config = CerebellumConfig(llm_backend=LLMBackend.ANTHROPIC)
         
         assert "anthropic" in config.base_url
+    
+    def test_apply_backend_defaults_switches_model(self):
+        """测试 apply_backend_defaults 在后端切换后更新 model 和 base_url"""
+        config = CerebellumConfig()  # 默认 DASHSCOPE: model=glm-5
+        assert config.model == "glm-5"
+        
+        # 模拟 env var 切换后端
+        config.llm_backend = LLMBackend.MINIMAX
+        config.apply_backend_defaults()
+        
+        assert config.model == "MiniMax-M2.5"
+        assert "minimaxi" in config.base_url
+    
+    def test_apply_backend_defaults_preserves_custom_model(self):
+        """测试 apply_backend_defaults 不覆盖用户自定义 model"""
+        config = CerebellumConfig(
+            llm_backend=LLMBackend.MINIMAX,
+            model="MiniMax-M2.1",
+        )
+        # model="MiniMax-M2.1" 不在默认值列表中，不应被覆盖
+        assert config.model == "MiniMax-M2.1"
+    
+    def test_apply_backend_defaults_preserves_custom_base_url(self):
+        """测试 apply_backend_defaults 不覆盖用户自定义 base_url"""
+        config = CerebellumConfig(
+            llm_backend=LLMBackend.MINIMAX,
+            base_url="https://custom.api.example.com/v1",
+        )
+        assert config.base_url == "https://custom.api.example.com/v1"
+    
+    def test_backend_defaults_class_variable(self):
+        """测试 BACKEND_DEFAULTS 类变量包含所有后端"""
+        defaults = CerebellumConfig.BACKEND_DEFAULTS
+        assert LLMBackend.DASHSCOPE in defaults
+        assert LLMBackend.MINIMAX in defaults
+        assert LLMBackend.ANTHROPIC in defaults
+        assert LLMBackend.OPENAI in defaults

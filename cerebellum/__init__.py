@@ -163,8 +163,10 @@ class Cerebellum:
             }
             if default_backend in backend_map:
                 self.config.llm_backend = backend_map[default_backend]
+                # 后端切换后重新应用默认的 model 和 base_url
+                self.config.apply_backend_defaults()
         
-        # 统一解析 API 密钥（按后端类型从环境变量获取）
+        # 统一解析 API 密钥、base_url、model（按后端类型从环境变量获取）
         env_key_map = {
             LLMBackend.DASHSCOPE: ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL"),
             LLMBackend.MINIMAX: ("MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIMAX_MODEL"),
@@ -179,6 +181,14 @@ class Cerebellum:
             self.config.daytona_api_key = os.getenv("DAYTONA_API_KEY", "")
         if not self.config.tavily_api_key:
             self.config.tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+        
+        # 允许环境变量覆盖 base_url 和 model
+        env_base_url = os.getenv(env_keys[1], "")
+        if env_base_url:
+            self.config.base_url = env_base_url
+        env_model = os.getenv(env_keys[2], "")
+        if env_model:
+            self.config.model = env_model
         
         self.llm = None
         self.backend = None
