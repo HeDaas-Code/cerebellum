@@ -5,9 +5,7 @@ htmlcov/
 coverage.xml
 *.cover
 logs/
-docs/
-cbot.py
-doc.txt
+
 output/
 *.db
 pytest.ini
