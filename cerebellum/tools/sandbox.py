@@ -262,6 +262,73 @@ class SandboxManager:
         
         return files
     
+    def configure_for_skill(self, skill_name: str, skill_content: str = None) -> None:
+        """
+        根据技能需求配置沙盒环境
+        
+        分析技能定义中的依赖和环境需求，自动安装依赖和配置环境
+        
+        Args:
+            skill_name: 技能名称
+            skill_content: 技能定义文件内容（SKILL.md）
+        """
+        if self._sandbox is None:
+            self._logger.warning("沙盒未创建，无法配置")
+            return
+        
+        # 根据技能名称推断依赖
+        skill_dependencies = {
+            "pdf": ["reportlab", "PyPDF2"],
+            "xlsx": ["openpyxl", "pandas"],
+            "docx": ["python-docx"],
+            "pptx": ["python-pptx"],
+            "chart": ["matplotlib", "seaborn", "pandas"],
+            "chart-creator": ["matplotlib", "seaborn", "pandas", "numpy"],
+            "image": ["Pillow"],
+            "web": ["requests", "beautifulsoup4"],
+            "api": ["requests", "httpx"],
+            "csv": ["pandas"],
+            "data-analysis": ["pandas", "numpy", "scipy"],
+        }
+        
+        packages = skill_dependencies.get(skill_name, [])
+        
+        # 如果有技能内容，从中提取依赖
+        if skill_content:
+            import re
+            # 查找 pip install 指令
+            pip_matches = re.findall(r'pip install\s+([\w\-\s]+)', skill_content)
+            for match in pip_matches:
+                for pkg in match.strip().split():
+                    if pkg and pkg not in packages:
+                        packages.append(pkg)
+            
+            # 查找 import 语句推断依赖
+            import_matches = re.findall(r'import\s+([\w]+)', skill_content)
+            import_map = {
+                "matplotlib": "matplotlib",
+                "seaborn": "seaborn",
+                "pandas": "pandas",
+                "numpy": "numpy",
+                "openpyxl": "openpyxl",
+                "PIL": "Pillow",
+                "reportlab": "reportlab",
+                "docx": "python-docx",
+                "pptx": "python-pptx",
+                "requests": "requests",
+                "bs4": "beautifulsoup4",
+                "scipy": "scipy",
+                "sklearn": "scikit-learn",
+            }
+            for imp in import_matches:
+                pkg = import_map.get(imp)
+                if pkg and pkg not in packages:
+                    packages.append(pkg)
+        
+        if packages:
+            self._logger.info(f"为技能 '{skill_name}' 安装依赖: {packages}")
+            self.install(packages)
+    
     def destroy(self):
         """
         销毁沙盒（任务完成后必须调用）

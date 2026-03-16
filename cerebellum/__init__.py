@@ -107,39 +107,29 @@ class Cerebellum:
         
         load_dotenv()
         
-        default_backend = os.getenv("DEFAULT_BACKEND", "dashscope").lower()
-        if default_backend == "minimax":
-            self.config.llm_backend = LLMBackend.MINIMAX
-            self.config.base_url = "https://api.minimaxi.com/anthropic"
-            self.config.model = "MiniMax-M2.5"
-        elif default_backend == "openai":
-            self.config.llm_backend = LLMBackend.OPENAI
-            self.config.base_url = "https://api.openai.com/v1"
-            self.config.model = "gpt-4o"
-        elif default_backend == "anthropic":
-            self.config.llm_backend = LLMBackend.ANTHROPIC
-            self.config.base_url = "https://api.anthropic.com"
-            self.config.model = "claude-sonnet-4-20250514"
-        else:
-            self.config.llm_backend = LLMBackend.DASHSCOPE
-            self.config.base_url = "https://coding.dashscope.aliyuncs.com/v1"
-            self.config.model = "glm-5"
+        # 从环境变量解析默认后端（仅当 config 未显式指定时）
+        default_backend = os.getenv("DEFAULT_BACKEND", "").lower()
+        if default_backend:
+            backend_map = {
+                "minimax": LLMBackend.MINIMAX,
+                "openai": LLMBackend.OPENAI,
+                "anthropic": LLMBackend.ANTHROPIC,
+                "dashscope": LLMBackend.DASHSCOPE,
+            }
+            if default_backend in backend_map:
+                self.config.llm_backend = backend_map[default_backend]
+        
+        # 统一解析 API 密钥（按后端类型从环境变量获取）
+        env_key_map = {
+            LLMBackend.DASHSCOPE: ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL"),
+            LLMBackend.MINIMAX: ("MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIMAX_MODEL"),
+            LLMBackend.OPENAI: ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"),
+            LLMBackend.ANTHROPIC: ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"),
+        }
+        env_keys = env_key_map.get(self.config.llm_backend, env_key_map[LLMBackend.DASHSCOPE])
         
         if not self.config.api_key:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.api_key = os.getenv("MINIMAX_API_KEY", "")
-            else:
-                self.config.api_key = os.getenv("DASHSCOPE_API_KEY", "")
-        if not self.config.base_url:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
-            else:
-                self.config.base_url = os.getenv("DASHSCOPE_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
-        if not self.config.model:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.model = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
-            else:
-                self.config.model = os.getenv("DASHSCOPE_MODEL", "glm-5")
+            self.config.api_key = os.getenv(env_keys[0], "")
         if not self.config.daytona_api_key:
             self.config.daytona_api_key = os.getenv("DAYTONA_API_KEY", "")
         if not self.config.tavily_api_key:
@@ -160,6 +150,7 @@ class Cerebellum:
         self.scheduler = None
         self.reporter = None
         self.web_search = None
+        self.summarizer = None
         
         self._setup_logging()
     
@@ -170,19 +161,39 @@ class Cerebellum:
             logger.debug("调试模式已启用")
     
     def _create_llm(self):
-        """创建 LLM 客户端"""
+        """创建 LLM 客户端（支持 DashScope/GLM5、MiniMax、Anthropic、OpenAI）"""
         logger.debug(f"创建 LLM 客户端: backend={self.config.llm_backend.value}, model={self.config.model}")
         
-        if self.config.llm_backend == LLMBackend.MINIMAX:
-            from langchain_anthropic import ChatAnthropic
-            return ChatAnthropic(
-                model=self.config.model,
-                anthropic_api_key=self.config.api_key,
-                anthropic_api_url=self.config.base_url,
-                temperature=0.7,
-                max_tokens=4096,
-            )
+        if self.config.llm_backend in (LLMBackend.MINIMAX, LLMBackend.ANTHROPIC):
+            # MiniMax (Anthropic 兼容) 和 Anthropic 使用 ChatAnthropic
+            try:
+                from langchain_anthropic import ChatAnthropic
+            except ImportError:
+                logger.warning("langchain-anthropic 未安装，回退到 ChatOpenAI")
+                return ChatOpenAI(
+                    model=self.config.model,
+                    base_url=self.config.base_url,
+                    api_key=self.config.api_key,
+                    temperature=0.7,
+                    max_tokens=4096,
+                )
+            
+            kwargs = {
+                "model": self.config.model,
+                "anthropic_api_key": self.config.api_key,
+                "temperature": 0.7,
+                "max_tokens": 4096,
+            }
+            
+            # MiniMax 使用自定义 base_url
+            if self.config.llm_backend == LLMBackend.MINIMAX:
+                kwargs["anthropic_api_url"] = self.config.base_url
+            elif self.config.base_url and "anthropic.com" not in self.config.base_url:
+                kwargs["anthropic_api_url"] = self.config.base_url
+            
+            return ChatAnthropic(**kwargs)
         
+        # DashScope (GLM5) 和 OpenAI 使用 ChatOpenAI
         return ChatOpenAI(
             model=self.config.model,
             base_url=self.config.base_url,
@@ -315,10 +326,20 @@ class Cerebellum:
         import re
         file_paths = []
         
-        # 匹配文件路径的正则表达式
+        # 支持的文件扩展名
+        valid_extensions = {
+            '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
+            '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
+            '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
+            '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
+        }
+        
+        # 匹配文件路径的正则表达式（更宽泛以支持多种路径格式）
+        ext_pattern = '|'.join(ext.lstrip('.') for ext in valid_extensions)
         patterns = [
-            r'/home/daytona/workspace/[\w\-\.]+\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)',  # 完整路径
-            r'\b([\w\-]+)\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)\b'  # 文件名
+            rf'/home/daytona/workspace/[\w\-\./]+\.(?:{ext_pattern})',  # 完整路径（含子目录）
+            rf'/tmp/[\w\-\./]+\.(?:{ext_pattern})',  # /tmp 目录
+            rf'\b([\w\-]+)\.({ext_pattern})\b'  # 独立文件名
         ]
         
         for pattern in patterns:
@@ -326,25 +347,28 @@ class Cerebellum:
             if matches:
                 for match in matches:
                     if isinstance(match, tuple):
-                        # 处理捕获组的情况
                         if len(match) >= 2 and match[0]:
                             filename = f"{match[0]}.{match[1]}"
                             file_paths.append(f"/home/daytona/workspace/{filename}")
                     else:
-                        # 清理路径中的特殊字符
                         cleaned_path = re.sub(r'[`"\']', '', match)
                         if cleaned_path:
                             file_paths.append(cleaned_path)
         
         # 过滤无效路径
-        valid_extensions = {'.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.txt', '.md'}
         valid_paths = []
         for path in file_paths:
             if any(path.lower().endswith(ext) for ext in valid_extensions):
                 valid_paths.append(path)
         
-        # 去重
-        return list(set(valid_paths))
+        # 去重（保持顺序）
+        seen = set()
+        result = []
+        for path in valid_paths:
+            if path not in seen:
+                seen.add(path)
+                result.append(path)
+        return result
     
     def _download_files_from_sandbox(self, specific_paths: List[str] = None) -> List[FileData]:
         """从沙盒下载文件并返回 FileData 列表"""
@@ -390,7 +414,12 @@ class Cerebellum:
                 except Exception as e:
                     logger.debug(f"find 失败: {e}")
                 
-                valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.csv', '.txt', '.md')
+                valid_extensions = (
+                    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
+                    '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
+                    '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
+                    '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
+                )
                 files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
             
             if not files:
@@ -695,13 +724,13 @@ else:
             logger.info(f"初始化缓存系统: {self.config.database_path}")
             self.db = DatabaseManager(self.config.database_path)
             
-            if self.config.tavily_api_key:
-                self.similarity_checker = SimilarityChecker(
-                    llm=self.llm,
-                    db=self.db,
-                    threshold=self.config.cache.similarity_threshold
-                )
-                logger.info("相似度检查器已启用")
+            # 相似度检查器始终启用（不依赖 tavily_api_key）
+            self.similarity_checker = SimilarityChecker(
+                llm=self.llm,
+                db=self.db,
+                threshold=self.config.cache.similarity_threshold
+            )
+            logger.info("相似度检查器已启用")
             
             self.cache_manager = CacheManager(
                 db=self.db,
@@ -728,6 +757,10 @@ else:
                 sandbox=self.sandbox_manager,
                 reflection_executor=self.reflection_executor
             )
+        
+        # 初始化工作流总结器
+        from .summary import WorkflowSummarizer
+        self.summarizer = WorkflowSummarizer(llm=self.llm, db=self.db)
         
         logger.success("编排器初始化完成")
     
@@ -1242,6 +1275,22 @@ else:
         result["execution_time_ms"] = execution_time_ms
         log_execution_time("任务", execution_time_ms)
         
+        # 生成工作流总结
+        if self.summarizer and result.get("reflection_chains"):
+            try:
+                summary = self.summarizer.summarize(
+                    task=task,
+                    result=result,
+                    intent=result.get("intent", ""),
+                    reflection_chains=result.get("reflection_chains", []),
+                    skills_used=result.get("skills_used", []),
+                    execution_time_ms=execution_time_ms,
+                )
+                result["summary"] = summary.to_dict()
+                logger.info(f"[总结] 生成工作流总结: {len(summary.constraints)} 个约束")
+            except Exception as e:
+                logger.debug(f"生成工作流总结失败: {e}")
+        
         return result
     
     def _build_file_prompt(self, task: str, files: List[tuple], result: Dict) -> str:
@@ -1315,6 +1364,7 @@ __all__ = [
     "CacheConfig",
     "ReflectionConfig",
     "SandboxConfig",
+    "LLMBackend",
     "FileData",
     "SubTask",
     "SubTaskStatus",
