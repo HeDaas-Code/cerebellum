@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 
 from ..types import TaskRecord, SimilarityResult
 from .database import DatabaseManager
+from ..utils import logger
 
 
 class SimilarityChecker:
@@ -48,9 +49,11 @@ class SimilarityChecker:
         Returns:
             相似度结果
         """
+        logger.debug(f"[相似度检查] 开始检查: {normalized_content[:50]}...")
         historical_tasks = self.db.get_all_tasks(limit=50)
         
         if not historical_tasks:
+            logger.debug("[相似度检查] 没有历史任务记录")
             return SimilarityResult(
                 is_similar=False,
                 score=0.0,
@@ -58,11 +61,13 @@ class SimilarityChecker:
                 reasoning="没有历史任务记录"
             )
         
+        logger.debug(f"[相似度检查] 找到 {len(historical_tasks)} 个历史任务")
+        
         best_match = None
         best_score = 0.0
         best_reasoning = ""
         
-        for hist_task in historical_tasks:
+        for i, hist_task in enumerate(historical_tasks):
             if hist_task.task_hash == task_hash:
                 continue
             
@@ -73,6 +78,8 @@ class SimilarityChecker:
                 hist_task.intent
             )
             
+            logger.debug(f"[相似度检查] 对比任务 {i+1}/{len(historical_tasks)}: 分数={score:.2f}")
+            
             if score > best_score:
                 best_score = score
                 best_match = hist_task
@@ -82,6 +89,7 @@ class SimilarityChecker:
         
         if best_match:
             self.db.save_similarity(task_hash, best_match.task_hash, best_score)
+            logger.debug(f"[相似度检查] 最佳匹配: {best_match.normalized_content[:30]}..., 分数: {best_score:.2f}")
         
         return SimilarityResult(
             is_similar=is_similar,
@@ -131,7 +139,27 @@ class SimilarityChecker:
         try:
             response = self.llm.invoke(prompt)
             import json
-            result = json.loads(response.content.strip().replace("```json", "").replace("```", ""))
-            return result.get("score", 0.0), result.get("reasoning", "")
-        except Exception:
+            
+            content = response.content
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get('type') == 'text':
+                            text_parts.append(block.get('text', ''))
+                        elif 'text' in block:
+                            text_parts.append(block['text'])
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = '\n'.join(text_parts)
+            else:
+                content = str(content)
+            
+            result = json.loads(content.strip().replace("```json", "").replace("```", ""))
+            score_val = result.get("score", 0.0)
+            reasoning_val = result.get("reasoning", "")
+            logger.debug(f"[LLM相似度比对] 分数: {score_val}, 理由: {reasoning_val}")
+            return score_val, reasoning_val
+        except Exception as e:
+            logger.debug(f"[LLM相似度比对] 比对失败: {e}")
             return 0.0, "比对失败"

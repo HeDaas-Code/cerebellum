@@ -7,6 +7,15 @@ Cerebellum 配置模块
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
+from enum import Enum
+
+
+class LLMBackend(Enum):
+    """LLM 后端类型"""
+    DASHSCOPE = "dashscope"
+    MINIMAX = "minimax"
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
 
 
 @dataclass
@@ -33,14 +42,23 @@ class SandboxConfig:
     timeout_seconds: int = 300
     max_retries: int = 3
     auto_cleanup: bool = True
+    image: Optional[str] = None
+    resources: dict = field(default_factory=lambda: {
+        "cpu": 2,
+        "memory": 4
+    })
+    env_vars: dict = field(default_factory=dict)
+    workdir: str = "/home/daytona/workspace"
+    pre_install: list = field(default_factory=list)
 
 
 @dataclass
 class CerebellumConfig:
     """Cerebellum 主配置类"""
-    dashscope_api_key: str = ""
-    dashscope_base_url: str = "https://coding.dashscope.aliyuncs.com/v1"
-    dashscope_model: str = "glm-5"
+    llm_backend: LLMBackend = LLMBackend.DASHSCOPE
+    api_key: str = ""
+    base_url: str = "https://coding.dashscope.aliyuncs.com/v1"
+    model: str = "glm-5"
     daytona_api_key: str = ""
     tavily_api_key: str = ""
     skills_dir: Optional[Path] = None
@@ -55,3 +73,13 @@ class CerebellumConfig:
     def __post_init__(self):
         if self.database_path is None:
             self.database_path = Path.home() / ".cerebellum" / "cache.db"
+        
+        if self.llm_backend == LLMBackend.MINIMAX:
+            self.base_url = "https://api.minimaxi.com/anthropic"
+            self.model = "MiniMax-M2.5"
+        elif self.llm_backend == LLMBackend.ANTHROPIC:
+            self.base_url = "https://api.anthropic.com"
+            self.model = "claude-sonnet-4-20250514"
+        elif self.llm_backend == LLMBackend.OPENAI:
+            self.base_url = "https://api.openai.com/v1"
+            self.model = "gpt-4o"

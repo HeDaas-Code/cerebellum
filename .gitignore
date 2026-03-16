@@ -11,3 +11,4 @@ doc.txt
 output/
 *.db
 pytest.ini
+/.env

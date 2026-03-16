@@ -5,7 +5,7 @@ Daytona 沙盒抽象层
 """
 
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 from ..types import ExecuteResult
@@ -36,6 +36,7 @@ class SandboxManager:
     1. 沙盒的一次性使用
     2. 资源的正确清理
     3. 操作的可追踪性
+    4. 支持自定义沙盒环境配置
     """
     
     def __init__(self, api_key: str, config: Optional[SandboxConfig] = None):
@@ -69,14 +70,51 @@ class SandboxManager:
             self._daytona = Daytona(config=daytona_config)
             
             self._logger.info("正在创建沙盒...")
-            self._sandbox = self._daytona.create()
+            
+            # 构建沙盒创建参数
+            create_kwargs = {}
+            
+            # 自定义镜像
+            if self.config.image:
+                self._logger.info(f"使用自定义镜像: {self.config.image}")
+                create_kwargs["image"] = self.config.image
+            
+            # 资源配置
+            if self.config.resources:
+                self._logger.debug(f"资源配置: {self.config.resources}")
+                # Daytona SDK 可能支持资源参数，具体取决于 SDK 版本
+            
+            self._sandbox = self._daytona.create(**create_kwargs)
             
             self._logger.info("等待沙盒启动...")
             self._sandbox.wait_for_sandbox_start(timeout=60)
             
             self._logger.info(f"沙盒创建成功: {self._sandbox.id}")
             
-            self.execute("mkdir -p /home/daytona/workspace && chmod 755 /home/daytona/workspace")
+            # 设置工作目录
+            workdir = self.config.workdir
+            self.execute(f"mkdir -p {workdir} && chmod 755 {workdir}")
+            
+            # 设置环境变量
+            if self.config.env_vars:
+                self._logger.info(f"设置环境变量: {list(self.config.env_vars.keys())}")
+                for key, value in self.config.env_vars.items():
+                    self.execute(f'export {key}="{value}" && echo "export {key}=***" >> ~/.bashrc')
+            
+            # 预安装依赖
+            if self.config.pre_install:
+                self._logger.info(f"预安装依赖: {self.config.pre_install}")
+                for package in self.config.pre_install:
+                    if isinstance(package, str):
+                        self.install([package])
+                    elif isinstance(package, dict):
+                        # 支持更复杂的安装配置
+                        pkg_name = package.get("name", "")
+                        pkg_type = package.get("type", "pip")
+                        if pkg_type == "pip":
+                            self.install([pkg_name])
+                        elif pkg_type == "apt":
+                            self.execute(f"apt-get update && apt-get install -y {pkg_name}", timeout=120)
             
             return self._sandbox.id
             

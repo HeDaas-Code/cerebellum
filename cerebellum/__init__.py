@@ -66,7 +66,7 @@ from .types import (
     FileData, SubTask, SubTaskStatus, TaskStatus, TaskResult,
     ReflectionHistory, CacheResult, CacheAction
 )
-from .config import CerebellumConfig, CacheConfig, ReflectionConfig, SandboxConfig
+from .config import CerebellumConfig, CacheConfig, ReflectionConfig, SandboxConfig, LLMBackend
 from .data import DatabaseManager
 from .data.task_encoder import TaskEncoder
 from .data.similarity import SimilarityChecker
@@ -107,12 +107,39 @@ class Cerebellum:
         
         load_dotenv()
         
-        if not self.config.dashscope_api_key:
-            self.config.dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "")
-        if not self.config.dashscope_base_url:
-            self.config.dashscope_base_url = os.getenv("DASHSCOPE_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
-        if not self.config.dashscope_model:
-            self.config.dashscope_model = os.getenv("DASHSCOPE_MODEL", "glm-5")
+        default_backend = os.getenv("DEFAULT_BACKEND", "dashscope").lower()
+        if default_backend == "minimax":
+            self.config.llm_backend = LLMBackend.MINIMAX
+            self.config.base_url = "https://api.minimaxi.com/anthropic"
+            self.config.model = "MiniMax-M2.5"
+        elif default_backend == "openai":
+            self.config.llm_backend = LLMBackend.OPENAI
+            self.config.base_url = "https://api.openai.com/v1"
+            self.config.model = "gpt-4o"
+        elif default_backend == "anthropic":
+            self.config.llm_backend = LLMBackend.ANTHROPIC
+            self.config.base_url = "https://api.anthropic.com"
+            self.config.model = "claude-sonnet-4-20250514"
+        else:
+            self.config.llm_backend = LLMBackend.DASHSCOPE
+            self.config.base_url = "https://coding.dashscope.aliyuncs.com/v1"
+            self.config.model = "glm-5"
+        
+        if not self.config.api_key:
+            if self.config.llm_backend == LLMBackend.MINIMAX:
+                self.config.api_key = os.getenv("MINIMAX_API_KEY", "")
+            else:
+                self.config.api_key = os.getenv("DASHSCOPE_API_KEY", "")
+        if not self.config.base_url:
+            if self.config.llm_backend == LLMBackend.MINIMAX:
+                self.config.base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
+            else:
+                self.config.base_url = os.getenv("DASHSCOPE_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
+        if not self.config.model:
+            if self.config.llm_backend == LLMBackend.MINIMAX:
+                self.config.model = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
+            else:
+                self.config.model = os.getenv("DASHSCOPE_MODEL", "glm-5")
         if not self.config.daytona_api_key:
             self.config.daytona_api_key = os.getenv("DAYTONA_API_KEY", "")
         if not self.config.tavily_api_key:
@@ -142,13 +169,24 @@ class Cerebellum:
         if self.debug:
             logger.debug("调试模式已启用")
     
-    def _create_llm(self) -> ChatOpenAI:
+    def _create_llm(self):
         """创建 LLM 客户端"""
-        logger.debug(f"创建 LLM 客户端: model={self.config.dashscope_model}")
+        logger.debug(f"创建 LLM 客户端: backend={self.config.llm_backend.value}, model={self.config.model}")
+        
+        if self.config.llm_backend == LLMBackend.MINIMAX:
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
+                model=self.config.model,
+                anthropic_api_key=self.config.api_key,
+                anthropic_api_url=self.config.base_url,
+                temperature=0.7,
+                max_tokens=4096,
+            )
+        
         return ChatOpenAI(
-            model=self.config.dashscope_model,
-            base_url=self.config.dashscope_base_url,
-            api_key=self.config.dashscope_api_key,
+            model=self.config.model,
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
             temperature=0.7,
             max_tokens=4096,
         )
@@ -166,8 +204,16 @@ class Cerebellum:
             )
             daytona = Daytona(config=daytona_config)
             
+            # 构建沙盒创建参数
+            create_kwargs = {}
+            
+            # 自定义镜像
+            if self.config.sandbox.image:
+                logger.info(f"使用自定义镜像: {self.config.sandbox.image}")
+                create_kwargs["image"] = self.config.sandbox.image
+            
             logger.debug("调用 daytona.create()...")
-            sandbox = daytona.create()
+            sandbox = daytona.create(**create_kwargs)
             
             logger.debug("等待沙盒启动...")
             sandbox.wait_for_sandbox_start(timeout=60)
@@ -176,8 +222,30 @@ class Cerebellum:
             work_dir = sandbox.get_work_dir()
             logger.debug(f"沙盒工作目录: {work_dir}")
             
+            # 设置工作目录
+            workdir = self.config.sandbox.workdir
             logger.debug("初始化沙盒环境...")
-            sandbox._process.exec("mkdir -p workspace && chmod 755 workspace", timeout=30)
+            sandbox._process.exec(f"mkdir -p {workdir} && chmod 755 {workdir}", timeout=30)
+            
+            # 设置环境变量
+            if self.config.sandbox.env_vars:
+                logger.info(f"设置环境变量: {list(self.config.sandbox.env_vars.keys())}")
+                for key, value in self.config.sandbox.env_vars.items():
+                    sandbox._process.exec(f'export {key}="{value}" && echo "export {key}=***" >> ~/.bashrc', timeout=10)
+            
+            # 预安装依赖
+            if self.config.sandbox.pre_install:
+                logger.info(f"预安装依赖: {self.config.sandbox.pre_install}")
+                for package in self.config.sandbox.pre_install:
+                    if isinstance(package, str):
+                        sandbox._process.exec(f"pip install {package}", timeout=120)
+                    elif isinstance(package, dict):
+                        pkg_name = package.get("name", "")
+                        pkg_type = package.get("type", "pip")
+                        if pkg_type == "pip":
+                            sandbox._process.exec(f"pip install {pkg_name}", timeout=120)
+                        elif pkg_type == "apt":
+                            sandbox._process.exec(f"apt-get update && apt-get install -y {pkg_name}", timeout=180)
             
             backend = DaytonaSandbox(sandbox=sandbox)
             
@@ -579,7 +647,14 @@ else:
 - 对于需要准确信息的任务（如游戏攻略、数据查询等），必须先搜索再处理
 
 ## 技能使用
-- 可以通过加载技能（Skills）来处理特定领域的任务
+- 你可以使用 skills 工具来调用各种技能
+- 可用技能包括:
+  - **pdf**: 处理 PDF 文件（读取、创建、合并、拆分等）
+  - **xlsx**: 处理 Excel 文件（数据分析、图表生成、格式设置）
+  - **docx**: 处理 Word 文档
+  - **pptx**: 创建 PowerPoint 演示文稿
+  - **image-analyzer**: 分析图片内容
+  - **file-delivery**: 文件传递和下载
 
 请始终以专业、友好的方式与用户交互。"""
         
@@ -617,7 +692,7 @@ else:
     def _init_cache_system(self):
         """初始化缓存系统"""
         if self.config.database_path:
-            logger.debug(f"初始化缓存系统: {self.config.database_path}")
+            logger.info(f"初始化缓存系统: {self.config.database_path}")
             self.db = DatabaseManager(self.config.database_path)
             
             if self.config.tavily_api_key:
@@ -626,6 +701,7 @@ else:
                     db=self.db,
                     threshold=self.config.cache.similarity_threshold
                 )
+                logger.info("相似度检查器已启用")
             
             self.cache_manager = CacheManager(
                 db=self.db,
@@ -659,9 +735,16 @@ else:
         """初始化 Agent（创建 LLM、沙盒、Agent）"""
         logger.info("正在初始化 Cerebellum 智能代理...")
         
-        logger.info("正在连接阿里百炼 LLM...")
+        backend_names = {
+            LLMBackend.DASHSCOPE: "阿里百炼",
+            LLMBackend.MINIMAX: "MiniMax",
+            LLMBackend.OPENAI: "OpenAI",
+            LLMBackend.ANTHROPIC: "Anthropic",
+        }
+        backend_name = backend_names.get(self.config.llm_backend, "未知")
+        logger.info(f"正在连接 {backend_name} LLM...")
         self.llm = self._create_llm()
-        logger.info(f"模型: {self.config.dashscope_model}")
+        logger.info(f"模型: {self.config.model}")
         
         logger.info("正在创建沙盒环境...")
         self.backend, self.sandbox = self._create_sandbox()
@@ -694,32 +777,33 @@ else:
     def _check_cache(self, task: str, files: List[tuple] = None) -> Optional[CacheResult]:
         """检查任务缓存"""
         if not self.cache_manager:
+            logger.debug("缓存管理器未初始化，跳过缓存检查")
             return None
         
-        logger.debug("检查任务缓存...")
+        logger.info("检查任务缓存...")
         task_hash, normalized, intent, file_hashes = TaskEncoder.encode(task, files)
         
         cache_result = self.cache_manager.check_cache(task_hash, normalized, intent)
         
         if cache_result.found:
             logger.info(f"缓存命中，相似度: {cache_result.similarity_score:.2f}")
-            self.reporter.report_cache_hit(
-                task_hash, 
-                cache_result.similarity_score,
-                "直接返回" if cache_result.action == CacheAction.DIRECT_RETURN else "继续处理"
-            )
+            if cache_result.action == CacheAction.DIRECT_RETURN:
+                logger.info("直接返回缓存结果")
+            else:
+                logger.info("继续处理任务（相似任务）")
         
         return cache_result
     
     def _store_cache(self, task: str, result_message: str, files: List[FileData]):
         """存储任务结果到缓存"""
         if not self.cache_manager:
+            logger.debug("缓存管理器未初始化，跳过缓存存储")
             return
         
-        logger.debug("存储任务结果到缓存...")
+        logger.info("存储任务结果到缓存...")
         task_hash, _, _, _ = TaskEncoder.encode(task)
         self.cache_manager.store_cache(task_hash, result_message, files)
-        logger.debug("缓存存储完成")
+        logger.success("缓存存储完成")
     
     def run(
         self, 
@@ -896,7 +980,20 @@ else:
                         msg_type = type(last_msg).__name__
                         content = ""
                         if hasattr(last_msg, "content"):
-                            content = str(last_msg.content)[:150] if last_msg.content else ""
+                            raw_content = last_msg.content
+                            if isinstance(raw_content, list):
+                                text_parts = []
+                                for block in raw_content:
+                                    if isinstance(block, dict):
+                                        if block.get('type') == 'text':
+                                            text_parts.append(block.get('text', ''))
+                                        elif 'text' in block:
+                                            text_parts.append(block['text'])
+                                    elif isinstance(block, str):
+                                        text_parts.append(block)
+                                content = '\n'.join(text_parts)
+                            else:
+                                content = str(raw_content) if raw_content else ""
                         
                         if msg_type == "AIMessage" and content.strip():
                             if "tool_calls" in last_msg.additional_kwargs:
@@ -919,11 +1016,25 @@ else:
                                         else:
                                             logger.info(f"[智能体] 步骤 {step_count}: 调用工具 {func_name}")
                             elif content.strip():
-                                logger.info(f"[智能体] 步骤 {step_count}: {content}...")
+                                logger.info(f"[智能体] 步骤 {step_count}: {content}")
                         
                         elif msg_type == "ToolMessage":
                             tool_name = getattr(last_msg, 'name', 'unknown')
-                            tool_content = str(last_msg.content)[:500] if last_msg.content else ""
+                            raw_tool_content = last_msg.content if last_msg.content else ""
+                            
+                            if isinstance(raw_tool_content, list):
+                                text_parts = []
+                                for block in raw_tool_content:
+                                    if isinstance(block, dict):
+                                        if block.get('type') == 'text':
+                                            text_parts.append(block.get('text', ''))
+                                        elif 'text' in block:
+                                            text_parts.append(block['text'])
+                                    elif isinstance(block, str):
+                                        text_parts.append(block)
+                                tool_content = '\n'.join(text_parts)
+                            else:
+                                tool_content = str(raw_tool_content)
                             
                             if ("Error" in tool_content or "error" in tool_content or 
                                 "失败" in tool_content or "Exception" in tool_content):
@@ -937,7 +1048,7 @@ else:
                                     logger.info(f"【反思链】中断执行，开始错误分析与修复 (第 {reflection_count} 次)")
                                     logger.info("=" * 60)
                                     logger.info(f"[反思链] 错误来源: {tool_name}")
-                                    logger.debug(f"[反思链] 错误详情: {tool_content[:200]}...")
+                                    logger.debug(f"[反思链] 错误详情: {tool_content}")
                                     
                                     chain = self.reflection_executor.execute_chain(
                                         error_message=tool_content,
@@ -1075,7 +1186,22 @@ else:
             
             if agent_result and "messages" in agent_result:
                 last_message = agent_result["messages"][-1]
-                result["message"] = last_message.content if hasattr(last_message, 'content') else str(last_message)
+                message_content = last_message.content if hasattr(last_message, 'content') else str(last_message)
+                
+                if isinstance(message_content, list):
+                    text_parts = []
+                    for block in message_content:
+                        if isinstance(block, dict):
+                            if block.get('type') == 'text':
+                                text_parts.append(block.get('text', ''))
+                            elif 'text' in block:
+                                text_parts.append(block['text'])
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+                    result["message"] = '\n'.join(text_parts)
+                else:
+                    result["message"] = str(message_content)
+                
                 logger.info("[结果收集] 任务处理完成")
                 result["success"] = True
             else:
@@ -1127,13 +1253,11 @@ else:
             if isinstance(file_data, bytes):
                 try:
                     content = file_data.decode('utf-8')
-                    preview = content[:500] + "..." if len(content) > 500 else content
-                    file_descriptions.append(f"- {filename}:\n```\n{preview}\n```")
+                    file_descriptions.append(f"- {filename}:\n```\n{content}\n```")
                 except UnicodeDecodeError:
                     file_descriptions.append(f"- {filename}: [二进制文件，大小: {len(file_data)} 字节]")
             else:
-                preview = str(file_data)[:500] + "..." if len(str(file_data)) > 500 else str(file_data)
-                file_descriptions.append(f"- {filename}:\n```\n{preview}\n```")
+                file_descriptions.append(f"- {filename}:\n```\n{str(file_data)}\n```")
             
             uploaded_info.append({"name": filename, "size": len(file_data) if isinstance(file_data, bytes) else len(str(file_data))})
         
