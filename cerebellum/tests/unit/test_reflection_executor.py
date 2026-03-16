@@ -291,10 +291,7 @@ class TestFatalConnectionErrorDetection:
     def test_remote_disconnected_is_fatal(self):
         """测试 RemoteDisconnected 被识别为致命错误"""
         from cerebellum import _is_fatal_connection_error
-        
-        # 模拟 RemoteDisconnected 错误
-        class RemoteDisconnected(Exception):
-            pass
+        from http.client import RemoteDisconnected
         
         error = RemoteDisconnected("Remote end closed connection without response")
         assert _is_fatal_connection_error(error) is True
@@ -337,9 +334,7 @@ class TestFatalConnectionErrorDetection:
     def test_nested_remote_disconnected_is_fatal(self):
         """测试嵌套的 RemoteDisconnected 也被识别为致命错误"""
         from cerebellum import _is_fatal_connection_error
-        
-        class RemoteDisconnected(Exception):
-            pass
+        from http.client import RemoteDisconnected
         
         inner = RemoteDisconnected("Remote end closed connection")
         outer = Exception("Retrying after connection broken")

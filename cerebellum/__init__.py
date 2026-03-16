@@ -1220,7 +1220,6 @@ else:
                                                 logger.warning(f"[反思链] 解决方案代码执行失败: {exec_err}")
                                                 if _is_fatal_connection_error(exec_err):
                                                     logger.error(f"[反思链] 沙盒连接已断开，终止执行")
-                                                    recursion_depth -= 1
                                                     return None
                                         
                                         logger.info("[反思链] 恢复任务执行...")
@@ -1253,7 +1252,6 @@ else:
                     # 检测致命连接错误 — 沙盒连接已断开，不可恢复
                     if _is_fatal_connection_error(e):
                         logger.error(f"[智能体] 检测到致命连接错误 ({type(e).__name__})，终止执行")
-                        recursion_depth -= 1
                         return None
                     
                     if self.reflection_executor and reflection_count < max_reflections:
@@ -1302,7 +1300,6 @@ else:
                                     # 解决方案代码执行中出现致命连接错误，终止
                                     if _is_fatal_connection_error(exec_err):
                                         logger.error(f"[反思链] 沙盒连接已断开，终止执行")
-                                        recursion_depth -= 1
                                         return None
                             
                             logger.info("[反思链] 恢复任务执行...")
@@ -1322,8 +1319,9 @@ else:
                             ]
                             return execute_with_reflection(new_messages, step_count)
                     
-                    recursion_depth -= 1
                     return None
+                finally:
+                    recursion_depth -= 1
             
             agent_result = execute_with_reflection([{"role": "user", "content": enhanced_prompt}])
             
