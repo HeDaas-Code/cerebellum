@@ -585,7 +585,7 @@ class Cerebellum:
     def _apply_output_fallback(self, result: Dict[str, Any], downloaded_files: List[FileData]) -> List[FileData]:
         """Generate corrective file when task marked success but no files are found."""
         files = downloaded_files or []
-        if result.get("success") and len(files) == 0:
+        if result.get("success") and not files:
             message = result.get("message") or OUTPUT_FALLBACK_MESSAGE
             logger.warning("任务标记成功但未找到输出文件，生成纠错文件 output.md")
             files.append(FileData(
@@ -1426,7 +1426,7 @@ else:
                 for f in downloaded_files
             ]
             
-            # downloaded_files may still be empty for failed runs; only log when something was collected
+            # downloaded_files may still be empty for failed runs where no fallback applies; only log when something was collected
             if downloaded_files:
                 logger.info(f"[结果收集] 已下载 {len(downloaded_files)} 个文件")
                 
