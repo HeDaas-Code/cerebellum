@@ -27,9 +27,9 @@ def _stub_deepagents_and_llm():
         sys.modules["deepagents.backends.utils"] = utils
     if "langchain_openai" not in sys.modules:
         lc = types.ModuleType("langchain_openai")
-        class _DummyChatOpenAI:
+        class _StubChatOpenAI:
             def __init__(self, *args, **kwargs): ...
-        lc.ChatOpenAI = _DummyChatOpenAI
+        lc.ChatOpenAI = _StubChatOpenAI
         sys.modules["langchain_openai"] = lc
     if "langchain_community" not in sys.modules:
         comm = types.ModuleType("langchain_community")

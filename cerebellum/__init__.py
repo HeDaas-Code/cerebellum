@@ -585,7 +585,7 @@ class Cerebellum:
     def _apply_output_fallback(self, result: Dict[str, Any], downloaded_files: List[FileData]) -> List[FileData]:
         """Generate corrective file when task marked success but no files are found."""
         files = downloaded_files or []
-        if result.get("success") and not files:
+        if result.get("success") and len(files) == 0:
             message = result.get("message") or OUTPUT_FALLBACK_MESSAGE
             logger.warning("任务标记成功但未找到输出文件，生成纠错文件 output.md")
             files.append(FileData(
@@ -596,7 +596,7 @@ class Cerebellum:
         return files
     
     def _get_file_size(self, file_path: str) -> int:
-        """获取沙盒中文件的大小 / Get sandbox file size."""
+        """获取沙盒中文件的大小 (Get sandbox file size)."""
         try:
             result = self.sandbox._process.exec(f"stat -c%s '{file_path}' 2>/dev/null || wc -c < '{file_path}'", timeout=10)
             if hasattr(result, 'result') and result.result:
