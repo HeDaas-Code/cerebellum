@@ -882,7 +882,6 @@ else:
         self.llm = self._create_llm()
         logger.info(f"模型: {self.config.model}")
         
-        logger.info("正在创建沙盒环境...")
         self.backend, self.sandbox = self._create_sandbox()
         
         if self.sandbox:
