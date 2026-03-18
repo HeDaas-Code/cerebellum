@@ -580,6 +580,19 @@ class Cerebellum:
         
         return files_data
     
+    def _apply_output_fallback(self, result: Dict[str, Any], downloaded_files: List[FileData]) -> List[FileData]:
+        """当任务标记成功但未找到文件时，生成纠错输出文件"""
+        files = downloaded_files or []
+        if result.get("success") and not files:
+            message = result.get("message") or "任务完成但未返回输出内容"
+            logger.warning("任务标记成功但未找到输出文件，生成纠错文件 output.md")
+            files.append(FileData(
+                name="output.md",
+                content=message,
+                type="text"
+            ))
+        return files
+    
     def _get_file_size(self, file_path: str) -> int:
         """获取沙盒中文件的大小"""
         try:
@@ -1405,11 +1418,13 @@ else:
                     logger.debug(f"  - {path}")
             
             downloaded_files = self._download_files_from_sandbox(file_paths_from_message)
+            downloaded_files = self._apply_output_fallback(result, downloaded_files)
+            result["files"] = [
+                {"name": f.name, "content": f.content, "type": f.type}
+                for f in downloaded_files
+            ]
+            
             if downloaded_files:
-                result["files"] = [
-                    {"name": f.name, "content": f.content, "type": f.type}
-                    for f in downloaded_files
-                ]
                 logger.info(f"[结果收集] 已下载 {len(downloaded_files)} 个文件")
                 
                 for f in downloaded_files:
