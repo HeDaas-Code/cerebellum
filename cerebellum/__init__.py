@@ -105,6 +105,12 @@ AGENT_STREAM_TIMEOUT = 600
 # execute_with_reflection 最大递归深度
 MAX_REFLECTION_RECURSION_DEPTH = 3
 
+# 自学习时从反思链中提取的最大解决方案数
+MAX_SOLUTIONS_TO_LEARN = 3
+
+# 反思链中表示无法生成解决方案的标记
+NO_SOLUTION_MESSAGE = "无法生成解决方案"
+
 
 def _is_fatal_connection_error(error: Exception) -> bool:
     """
@@ -1041,7 +1047,7 @@ else:
                                 logger.info(f"[技能创建] 正在为 '{st.name}' 自主创建新技能...")
                                 try:
                                     new_skill = self.skill_creator.create_skill(
-                                        name=st.name.replace(" ", "-").lower(),
+                                        name=self._sanitize_skill_name(st.name),
                                         task_description=task,
                                         subtask_description=st.description,
                                     )
@@ -1446,6 +1452,16 @@ else:
         
         return result
     
+    @staticmethod
+    def _sanitize_skill_name(text: str) -> str:
+        """将任意文本转为合法的技能名称（小写、连字符分隔）"""
+        import re
+        name = re.sub(r'[^\w\u4e00-\u9fff-]', '-', text[:30]).strip('-').lower()
+        if not name:
+            import hashlib
+            name = hashlib.md5(text.encode()).hexdigest()[:8]
+        return name
+    
     def _learn_from_execution(self, task: str, result: Dict[str, Any]):
         """
         从成功执行中学习，自动创建或强化技能
@@ -1454,7 +1470,6 @@ else:
         使 agent 在未来遇到类似任务时能直接复用。
         """
         reflection_chains = result.get("reflection_chains", [])
-        skills_used = result.get("skills_used", [])
         
         # 仅在有反思链（即遇到过问题并成功解决）时学习
         successful_chains = [c for c in reflection_chains if c.get("success")]
@@ -1466,16 +1481,14 @@ else:
         for chain in successful_chains:
             solution = chain.get("solution", "")
             problem = chain.get("problem", "")
-            if solution and solution != "无法生成解决方案":
+            if solution and solution != NO_SOLUTION_MESSAGE:
                 solutions.append(f"问题: {problem}\n解决: {solution}")
         
         if not solutions:
             return
         
-        # 生成技能名称（基于任务关键词）
-        import re
-        task_key = re.sub(r'[^\w\u4e00-\u9fff-]', '-', task[:30]).strip('-').lower()
-        skill_name = f"learned-{task_key}" if task_key else f"learned-{hash(task) % 10000:04d}"
+        # 生成技能名称（基于任务关键词，使用确定性哈希）
+        skill_name = f"learned-{self._sanitize_skill_name(task)}"
         
         # 检查是否已存在同名技能
         skill_key = f"cerebellum/skills/{skill_name}/SKILL.md"
@@ -1483,7 +1496,7 @@ else:
             return
         
         try:
-            solutions_text = "\n".join(solutions[:3])
+            solutions_text = "\n".join(solutions[:MAX_SOLUTIONS_TO_LEARN])
             new_skill = self.skill_creator.create_skill(
                 name=skill_name,
                 task_description=task,
