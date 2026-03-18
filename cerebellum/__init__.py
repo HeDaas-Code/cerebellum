@@ -73,7 +73,7 @@ from .data.similarity import SimilarityChecker
 from .data.cache_manager import CacheManager
 from .tools import SandboxManager
 from .reflection import ReflectionChainExecutor
-from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter
+from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter, SkillCreator
 
 
 DEFAULT_SKILLS_DIR = Path(__file__).parent / "skills"
@@ -851,6 +851,10 @@ else:
                 reflection_executor=self.reflection_executor
             )
         
+        # 初始化技能创建器
+        skills_path = self.config.skills_dir or DEFAULT_SKILLS_DIR
+        self.skill_creator = SkillCreator(llm=self.llm, skills_dir=skills_path)
+        
         # 初始化工作流总结器
         from .summary import WorkflowSummarizer
         self.summarizer = WorkflowSummarizer(llm=self.llm, db=self.db)
@@ -1027,6 +1031,36 @@ else:
             if available_skills:
                 logger.info(f"[任务规划器] 可用技能: {available_skills}")
                 skill_mapping = self.planner.match_skills(subtasks, available_skills)
+                
+                # 处理 skill-creator 信号：自主创建缺失的技能
+                if skill_mapping and hasattr(self, 'skill_creator'):
+                    for st_id, skill in list(skill_mapping.items()):
+                        if skill == "skill-creator":
+                            st = next((s for s in subtasks if s.id == st_id), None)
+                            if st:
+                                logger.info(f"[技能创建] 正在为 '{st.name}' 自主创建新技能...")
+                                try:
+                                    new_skill = self.skill_creator.create_skill(
+                                        name=st.name.replace(" ", "-").lower(),
+                                        task_description=task,
+                                        subtask_description=st.description,
+                                    )
+                                    if new_skill and new_skill.get("content"):
+                                        new_name = new_skill["name"]
+                                        # 注入到 skills_files 供 agent 使用
+                                        skill_key = f"cerebellum/skills/{new_name}/SKILL.md"
+                                        self.skills_files[skill_key] = new_skill["content"]
+                                        # 更新映射为实际技能名
+                                        skill_mapping[st_id] = new_name
+                                        available_skills.append(new_name)
+                                        logger.success(f"[技能创建] 新技能已创建: {new_name}")
+                                    else:
+                                        logger.warning(f"[技能创建] 技能创建返回空内容: {st.name}")
+                                        del skill_mapping[st_id]
+                                except Exception as e:
+                                    logger.warning(f"[技能创建] 创建失败: {e}")
+                                    del skill_mapping[st_id]
+                
                 if skill_mapping:
                     logger.info("[任务规划器] 技能匹配结果:")
                     for st_id, skill in skill_mapping.items():
@@ -1406,7 +1440,60 @@ else:
             except Exception as e:
                 logger.debug(f"生成工作流总结失败: {e}")
         
+        # 自学习：成功执行后，从反思链中学习并创建/强化技能
+        if result.get("success") and hasattr(self, 'skill_creator'):
+            self._learn_from_execution(task, result)
+        
         return result
+    
+    def _learn_from_execution(self, task: str, result: Dict[str, Any]):
+        """
+        从成功执行中学习，自动创建或强化技能
+        
+        当任务成功完成且有反思链记录时，将解决方案提炼为新技能，
+        使 agent 在未来遇到类似任务时能直接复用。
+        """
+        reflection_chains = result.get("reflection_chains", [])
+        skills_used = result.get("skills_used", [])
+        
+        # 仅在有反思链（即遇到过问题并成功解决）时学习
+        successful_chains = [c for c in reflection_chains if c.get("success")]
+        if not successful_chains:
+            return
+        
+        # 提炼解决方案摘要
+        solutions = []
+        for chain in successful_chains:
+            solution = chain.get("solution", "")
+            problem = chain.get("problem", "")
+            if solution and solution != "无法生成解决方案":
+                solutions.append(f"问题: {problem}\n解决: {solution}")
+        
+        if not solutions:
+            return
+        
+        # 生成技能名称（基于任务关键词）
+        import re
+        task_key = re.sub(r'[^\w\u4e00-\u9fff-]', '-', task[:30]).strip('-').lower()
+        skill_name = f"learned-{task_key}" if task_key else f"learned-{hash(task) % 10000:04d}"
+        
+        # 检查是否已存在同名技能
+        skill_key = f"cerebellum/skills/{skill_name}/SKILL.md"
+        if skill_key in self.skills_files:
+            return
+        
+        try:
+            solutions_text = "\n".join(solutions[:3])
+            new_skill = self.skill_creator.create_skill(
+                name=skill_name,
+                task_description=task,
+                subtask_description=f"从反思链学习的解决方案:\n{solutions_text}",
+            )
+            if new_skill and new_skill.get("content"):
+                self.skills_files[skill_key] = new_skill["content"]
+                logger.info(f"[自学习] 从执行经验中学习并创建新技能: {skill_name}")
+        except Exception as e:
+            logger.debug(f"[自学习] 技能学习失败: {e}")
     
     def _build_file_prompt(self, task: str, files: List[tuple], result: Dict) -> str:
         """构建包含文件信息的提示"""

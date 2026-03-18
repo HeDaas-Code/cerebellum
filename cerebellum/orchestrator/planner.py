@@ -339,7 +339,7 @@ class TaskPlanner:
         return skill_mapping
     
     def _match_skill_by_keywords(self, subtask: SubTask, available_skills: List[str]) -> str:
-        """基于关键词匹配技能（回退方案）"""
+        """基于关键词匹配技能（回退方案，无匹配时返回 skill-creator）"""
         available_lower = [s.lower() for s in available_skills]
         subtask_text = f"{subtask.name} {subtask.description}".lower()
         
@@ -351,4 +351,6 @@ class TaskPlanner:
                             return available_skills[i]
                     break
         
-        return None
+        # 无匹配时回退到 skill-creator（自主创建新技能）
+        logger.debug(f"关键词匹配未找到技能: '{subtask.name}'，回退到 skill-creator")
+        return "skill-creator"
