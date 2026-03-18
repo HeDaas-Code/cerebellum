@@ -4,6 +4,16 @@ import types
 import pytest
 
 
+STUB_OPTIONAL_MODULES = [
+    "daytona",
+    "daytona_sdk",
+    "daytona_sdk.common",
+    "daytona_sdk.common.daytona",
+    "langchain_daytona",
+    "sentence_transformers",
+]
+
+
 def _stub_deepagents_and_llm():
     if "deepagents" not in sys.modules:
         da = types.ModuleType("deepagents")
@@ -29,7 +39,7 @@ def _stub_deepagents_and_llm():
         comm.tools.TavilySearchResults = _DummyTavily
         sys.modules["langchain_community"] = comm
         sys.modules["langchain_community.tools"] = comm.tools
-    for name in ["daytona", "daytona_sdk", "daytona_sdk.common", "daytona_sdk.common.daytona", "langchain_daytona", "sentence_transformers"]:
+    for name in STUB_OPTIONAL_MODULES:
         if name not in sys.modules:
             sys.modules[name] = types.ModuleType(name)
 

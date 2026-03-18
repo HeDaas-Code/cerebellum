@@ -1426,6 +1426,7 @@ else:
                 for f in downloaded_files
             ]
             
+            # downloaded_files may still be empty for failed runs; only log when something was collected
             if downloaded_files:
                 logger.info(f"[结果收集] 已下载 {len(downloaded_files)} 个文件")
                 
