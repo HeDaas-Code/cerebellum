@@ -91,6 +91,8 @@ SAFE_PATH_PREFIXES = ('/home/daytona/workspace/', '/tmp/')
 
 # 沙盒创建日志消息
 SANDBOX_CREATING_MESSAGE = "正在创建沙盒环境..."
+# 任务成功但未返回文件时的纠错提示
+OUTPUT_FALLBACK_MESSAGE = "任务完成但未返回输出内容"
 
 # 致命连接错误类型名称 — 不可恢复，应立即终止而非重试
 FATAL_ERROR_NAMES = frozenset({
@@ -581,10 +583,10 @@ class Cerebellum:
         return files_data
     
     def _apply_output_fallback(self, result: Dict[str, Any], downloaded_files: List[FileData]) -> List[FileData]:
-        """当任务标记成功但未找到文件时，生成纠错输出文件"""
+        """Generate corrective file when task marked success but no files are found."""
         files = downloaded_files or []
         if result.get("success") and not files:
-            message = result.get("message") or "任务完成但未返回输出内容"
+            message = result.get("message") or OUTPUT_FALLBACK_MESSAGE
             logger.warning("任务标记成功但未找到输出文件，生成纠错文件 output.md")
             files.append(FileData(
                 name="output.md",
@@ -594,7 +596,7 @@ class Cerebellum:
         return files
     
     def _get_file_size(self, file_path: str) -> int:
-        """获取沙盒中文件的大小"""
+        """获取沙盒中文件的大小 / Get sandbox file size."""
         try:
             result = self.sandbox._process.exec(f"stat -c%s '{file_path}' 2>/dev/null || wc -c < '{file_path}'", timeout=10)
             if hasattr(result, 'result') and result.result:

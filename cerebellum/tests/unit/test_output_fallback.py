@@ -7,25 +7,25 @@ import pytest
 def _stub_deepagents_and_llm():
     if "deepagents" not in sys.modules:
         da = types.ModuleType("deepagents")
-        da.create_deep_agent = lambda *a, **k: None
+        da.create_deep_agent = lambda *args, **kwargs: None
         sys.modules["deepagents"] = da
     if "deepagents.backends" not in sys.modules:
         sys.modules["deepagents.backends"] = types.ModuleType("deepagents.backends")
     if "deepagents.backends.utils" not in sys.modules:
         utils = types.ModuleType("deepagents.backends.utils")
-        utils.create_file_data = lambda *a, **k: None
+        utils.create_file_data = lambda *args, **kwargs: None
         sys.modules["deepagents.backends.utils"] = utils
     if "langchain_openai" not in sys.modules:
         lc = types.ModuleType("langchain_openai")
         class _DummyChatOpenAI:
-            def __init__(self, *a, **k): ...
+            def __init__(self, *args, **kwargs): ...
         lc.ChatOpenAI = _DummyChatOpenAI
         sys.modules["langchain_openai"] = lc
     if "langchain_community" not in sys.modules:
         comm = types.ModuleType("langchain_community")
         comm.tools = types.ModuleType("langchain_community.tools")
         class _DummyTavily:
-            def __init__(self, *a, **k): ...
+            def __init__(self, *args, **kwargs): ...
         comm.tools.TavilySearchResults = _DummyTavily
         sys.modules["langchain_community"] = comm
         sys.modules["langchain_community.tools"] = comm.tools
