@@ -5,8 +5,11 @@ from cerebellum.config import CerebellumConfig
 from cerebellum.utils import logger
 
 
+SANDBOX_LOG_MSG = "正在创建沙盒环境..."
+
+
 def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
-    """确保初始化时只记录一次沙盒创建日志"""
+    """Ensure sandbox creation log is emitted only once during initialization."""
     config = CerebellumConfig(
         api_key="test-key",
         base_url="https://example.com",
@@ -16,11 +19,11 @@ def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
     )
     cb = Cerebellum(config=config)
 
-    # 避免实际外部调用
+    # Avoid actual external calls
     monkeypatch.setattr(cb, "_create_llm", lambda: MagicMock(name="llm"))
 
     def _mock_create_sandbox():
-        logger.info("正在创建沙盒环境...")
+        logger.info(SANDBOX_LOG_MSG)
         return MagicMock(name="backend"), MagicMock(name="sandbox")
 
     monkeypatch.setattr(cb, "_create_sandbox", _mock_create_sandbox)
@@ -36,5 +39,5 @@ def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
     finally:
         logger.remove(sink_id)
 
-    sandbox_logs = [msg for msg in captured if "正在创建沙盒环境..." in msg]
+    sandbox_logs = [msg for msg in captured if SANDBOX_LOG_MSG in msg]
     assert len(sandbox_logs) == 1
