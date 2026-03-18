@@ -35,6 +35,7 @@ import os
 import sys
 import time
 import threading
+from queue import Queue, Empty
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -723,6 +724,65 @@ print(base64.b64encode(data).decode('ascii'))
         except Exception as e:
             logger.warning(f"清理沙盒时出错: {e}")
     
+    def _stream_agent_events(self, prompt_messages, timeout: Optional[int] = None):
+        """
+        以超时保护的方式流式获取 agent 事件，避免工具执行长时间卡死。
+        
+        Args:
+            prompt_messages: 传递给 agent 的消息列表
+            timeout: 可选超时（秒），默认使用 sandbox.timeout_seconds 或 AGENT_STREAM_TIMEOUT
+        """
+        effective_timeout = timeout
+        if not effective_timeout:
+            if getattr(self.config, "sandbox", None) and getattr(self.config.sandbox, "timeout_seconds", None):
+                effective_timeout = self.config.sandbox.timeout_seconds
+            else:
+                effective_timeout = AGENT_STREAM_TIMEOUT
+        # 合理下限，避免 0/负值导致立即超时
+        effective_timeout = max(1, effective_timeout)
+        
+        stop_token = object()
+        queue: Queue = Queue()
+        
+        def _produce():
+            try:
+                for event in self.agent.stream(
+                    {"messages": prompt_messages, "files": self.skills_files},
+                    stream_mode="values"
+                ):
+                    queue.put(event)
+            except Exception as exc:  # 捕获异常传递给消费端
+                queue.put(exc)
+            finally:
+                queue.put(stop_token)
+        
+        producer = threading.Thread(target=_produce, daemon=True)
+        producer.start()
+        
+        deadline = time.time() + effective_timeout
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"智能体执行超时 ({effective_timeout}s)")
+                
+                try:
+                    # 使用较小的等待窗口以便及时检测 stop_token 或超时
+                    item = queue.get(timeout=min(1.0, max(0.05, remaining)))
+                except Empty:
+                    continue
+                
+                if item is stop_token:
+                    break
+                
+                if isinstance(item, Exception):
+                    raise item
+                
+                yield item
+        finally:
+            # 确保线程结束，避免资源泄漏
+            producer.join(timeout=0.1)
+    
     def _create_agent(self):
         """创建 Agent"""
         logger.debug("创建 Agent...")
@@ -1152,10 +1212,7 @@ else:
                     return None
                 
                 try:
-                    for event in self.agent.stream(
-                        {"messages": prompt_messages, "files": self.skills_files},
-                        stream_mode="values"
-                    ):
+                    for event in self._stream_agent_events(prompt_messages):
                         if not event:
                             continue
                         
