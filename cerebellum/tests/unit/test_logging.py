@@ -1,11 +1,8 @@
 from unittest.mock import MagicMock
 
-from cerebellum import Cerebellum
+from cerebellum import Cerebellum, SANDBOX_CREATING_MESSAGE
 from cerebellum.config import CerebellumConfig
 from cerebellum.utils import logger
-
-
-SANDBOX_LOG_MSG = "正在创建沙盒环境..."
 
 
 def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
@@ -23,7 +20,7 @@ def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
     monkeypatch.setattr(cb, "_create_llm", lambda: MagicMock(name="llm"))
 
     def _mock_create_sandbox():
-        logger.info(SANDBOX_LOG_MSG)
+        logger.info(SANDBOX_CREATING_MESSAGE)
         return MagicMock(name="backend"), MagicMock(name="sandbox")
 
     monkeypatch.setattr(cb, "_create_sandbox", _mock_create_sandbox)
@@ -33,11 +30,11 @@ def test_initialize_logs_sandbox_creation_once(monkeypatch, tmp_path):
     monkeypatch.setattr(cb, "_load_skills_files", lambda *args, **kwargs: {})
 
     captured = []
-    sink_id = logger.add(lambda message: captured.append(str(message).strip()))
+    sink_id = logger.add(lambda message: captured.append(message.record.get("message", "")))
     try:
         cb.initialize()
     finally:
         logger.remove(sink_id)
 
-    sandbox_logs = [msg for msg in captured if SANDBOX_LOG_MSG in msg]
+    sandbox_logs = [msg for msg in captured if SANDBOX_CREATING_MESSAGE in msg]
     assert len(sandbox_logs) == 1

@@ -89,6 +89,9 @@ VALID_FILE_EXTENSIONS = {
 # 安全的沙盒路径前缀
 SAFE_PATH_PREFIXES = ('/home/daytona/workspace/', '/tmp/')
 
+# 沙盒创建日志消息
+SANDBOX_CREATING_MESSAGE = "正在创建沙盒环境..."
+
 # 致命连接错误类型名称 — 不可恢复，应立即终止而非重试
 FATAL_ERROR_NAMES = frozenset({
     'RemoteDisconnected',
@@ -316,7 +319,7 @@ class Cerebellum:
             return None, None
         
         try:
-            logger.info("正在创建沙盒环境...")
+            logger.info(SANDBOX_CREATING_MESSAGE)
             daytona_config = DaytonaConfig(
                 api_key=self.config.daytona_api_key if self.config.daytona_api_key else None
             )
