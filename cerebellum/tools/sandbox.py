@@ -39,6 +39,30 @@ class SandboxManager:
     4. 支持自定义沙盒环境配置
     """
     
+    # 技能名称到 pip 依赖的映射
+    SKILL_DEPENDENCIES = {
+        "pdf": ["reportlab", "PyPDF2"],
+        "xlsx": ["openpyxl", "pandas"],
+        "docx": ["python-docx"],
+        "pptx": ["python-pptx"],
+        "chart": ["matplotlib", "seaborn", "pandas"],
+        "chart-creator": ["matplotlib", "seaborn", "pandas", "numpy"],
+        "image": ["Pillow"],
+        "web": ["requests", "beautifulsoup4"],
+        "api": ["requests", "httpx"],
+        "csv": ["pandas"],
+        "data-analysis": ["pandas", "numpy", "scipy"],
+    }
+    
+    # import 名到 pip 包名的映射（仅包含不同名的）
+    IMPORT_TO_PACKAGE = {
+        "PIL": "Pillow",
+        "bs4": "beautifulsoup4",
+        "docx": "python-docx",
+        "pptx": "python-pptx",
+        "sklearn": "scikit-learn",
+    }
+    
     def __init__(self, api_key: str, config: Optional[SandboxConfig] = None):
         """
         初始化沙盒管理器
@@ -261,6 +285,43 @@ class SandboxManager:
                     ))
         
         return files
+    
+    def configure_for_skill(self, skill_name: str, skill_content: str = None) -> None:
+        """
+        根据技能需求配置沙盒环境
+        
+        分析技能定义中的依赖和环境需求，自动安装依赖和配置环境
+        
+        Args:
+            skill_name: 技能名称
+            skill_content: 技能定义文件内容（SKILL.md）
+        """
+        if self._sandbox is None:
+            self._logger.warning("沙盒未创建，无法配置")
+            return
+        
+        packages = list(self.SKILL_DEPENDENCIES.get(skill_name, []))
+        
+        # 如果有技能内容，从中提取依赖
+        if skill_content:
+            import re
+            # 查找 pip install 指令
+            pip_matches = re.findall(r'pip install\s+([\w\-\s]+)', skill_content)
+            for match in pip_matches:
+                for pkg in match.strip().split():
+                    if pkg and pkg not in packages:
+                        packages.append(pkg)
+            
+            # 查找 import 语句推断依赖（仅不同名的映射）
+            import_matches = re.findall(r'import\s+([\w]+)', skill_content)
+            for imp in import_matches:
+                pkg = self.IMPORT_TO_PACKAGE.get(imp)
+                if pkg and pkg not in packages:
+                    packages.append(pkg)
+        
+        if packages:
+            self._logger.info(f"为技能 '{skill_name}' 安装依赖: {packages}")
+            self.install(packages)
     
     def destroy(self):
         """

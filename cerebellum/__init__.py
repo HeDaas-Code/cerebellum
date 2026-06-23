@@ -35,6 +35,7 @@ import os
 import sys
 import time
 import threading
+from queue import Queue, Empty
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -73,10 +74,112 @@ from .data.similarity import SimilarityChecker
 from .data.cache_manager import CacheManager
 from .tools import SandboxManager
 from .reflection import ReflectionChainExecutor
-from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter
+from .orchestrator import TaskPlanner, TaskScheduler, TaskReporter, SkillCreator
 
 
 DEFAULT_SKILLS_DIR = Path(__file__).parent / "skills"
+
+# 支持的文件扩展名（用于文件路径提取和下载）
+VALID_FILE_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg',
+    '.pdf', '.xlsx', '.xls', '.csv', '.txt', '.md', '.json',
+    '.docx', '.doc', '.pptx', '.ppt', '.html', '.xml',
+    '.py', '.js', '.ts', '.sh', '.zip', '.tar', '.gz',
+}
+
+# 安全的沙盒路径前缀
+SAFE_PATH_PREFIXES = ('/home/daytona/workspace/', '/tmp/')
+
+# 沙盒创建日志消息
+SANDBOX_CREATING_MESSAGE = "正在创建沙盒环境..."
+# 任务成功但未返回文件时的纠错提示
+OUTPUT_FALLBACK_MESSAGE = "任务完成但未返回输出内容"
+
+# 致命连接错误类型名称 — 不可恢复，应立即终止而非重试
+FATAL_ERROR_NAMES = frozenset({
+    'RemoteDisconnected',
+    'ConnectionResetError',
+    'ConnectionRefusedError',
+    'ConnectionAbortedError',
+    'BrokenPipeError',
+    'ProtocolError',
+})
+
+# agent.stream() 默认超时（秒）
+AGENT_STREAM_TIMEOUT = 600
+
+# execute_with_reflection 最大递归深度
+MAX_REFLECTION_RECURSION_DEPTH = 3
+
+# 自学习时从反思链中提取的最大解决方案数
+MAX_SOLUTIONS_TO_LEARN = 3
+
+# 反思链中表示无法生成解决方案的标记
+NO_SOLUTION_MESSAGE = "无法生成解决方案"
+
+
+def _is_fatal_connection_error(error: Exception) -> bool:
+    """
+    检测是否为致命的连接错误（不可恢复）
+    
+    这些错误表示底层网络连接已断开，
+    重试只会无限等待，应立即终止执行。
+    """
+    error_type = type(error).__name__
+    if error_type in FATAL_ERROR_NAMES:
+        return True
+    
+    # 检查异常链中的嵌套错误
+    cause = error.__cause__ or error.__context__
+    while cause:
+        if type(cause).__name__ in FATAL_ERROR_NAMES:
+            return True
+        cause = getattr(cause, '__cause__', None) or getattr(cause, '__context__', None)
+    
+    # 检查错误消息中的连接错误特征
+    error_str = str(error)
+    fatal_patterns = [
+        'RemoteDisconnected',
+        'Remote end closed connection',
+        'Connection reset by peer',
+        'Connection refused',
+        'Broken pipe',
+    ]
+    return any(pattern in error_str for pattern in fatal_patterns)
+
+
+def extract_llm_content(response) -> str:
+    """
+    统一提取 LLM 响应内容（兼容所有后端格式）
+    
+    处理字符串、列表格式（Anthropic 兼容）等多种内容格式
+    
+    Args:
+        response: LLM 响应对象或内容
+    
+    Returns:
+        提取的文本内容
+    """
+    content = response
+    if hasattr(response, 'content'):
+        content = response.content
+    
+    if isinstance(content, str):
+        return content
+    
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get('type') == 'text':
+                    text_parts.append(block.get('text', ''))
+                elif 'text' in block:
+                    text_parts.append(block['text'])
+            elif isinstance(block, str):
+                text_parts.append(block)
+        return '\n'.join(text_parts)
+    
+    return str(content) if content else ""
 
 
 class Cerebellum:
@@ -107,43 +210,43 @@ class Cerebellum:
         
         load_dotenv()
         
-        default_backend = os.getenv("DEFAULT_BACKEND", "dashscope").lower()
-        if default_backend == "minimax":
-            self.config.llm_backend = LLMBackend.MINIMAX
-            self.config.base_url = "https://api.minimaxi.com/anthropic"
-            self.config.model = "MiniMax-M2.5"
-        elif default_backend == "openai":
-            self.config.llm_backend = LLMBackend.OPENAI
-            self.config.base_url = "https://api.openai.com/v1"
-            self.config.model = "gpt-4o"
-        elif default_backend == "anthropic":
-            self.config.llm_backend = LLMBackend.ANTHROPIC
-            self.config.base_url = "https://api.anthropic.com"
-            self.config.model = "claude-sonnet-4-20250514"
-        else:
-            self.config.llm_backend = LLMBackend.DASHSCOPE
-            self.config.base_url = "https://coding.dashscope.aliyuncs.com/v1"
-            self.config.model = "glm-5"
+        # 从环境变量解析默认后端（仅当 config 未显式指定时）
+        default_backend = os.getenv("DEFAULT_BACKEND", "").lower()
+        if default_backend:
+            backend_map = {
+                "minimax": LLMBackend.MINIMAX,
+                "openai": LLMBackend.OPENAI,
+                "anthropic": LLMBackend.ANTHROPIC,
+                "dashscope": LLMBackend.DASHSCOPE,
+            }
+            if default_backend in backend_map:
+                self.config.llm_backend = backend_map[default_backend]
+                # 后端切换后重新应用默认的 model 和 base_url
+                self.config.apply_backend_defaults()
+        
+        # 统一解析 API 密钥、base_url、model（按后端类型从环境变量获取）
+        env_key_map = {
+            LLMBackend.DASHSCOPE: ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL"),
+            LLMBackend.MINIMAX: ("MINIMAX_API_KEY", "MINIMAX_BASE_URL", "MINIMAX_MODEL"),
+            LLMBackend.OPENAI: ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"),
+            LLMBackend.ANTHROPIC: ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"),
+        }
+        env_keys = env_key_map.get(self.config.llm_backend, env_key_map[LLMBackend.DASHSCOPE])
         
         if not self.config.api_key:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.api_key = os.getenv("MINIMAX_API_KEY", "")
-            else:
-                self.config.api_key = os.getenv("DASHSCOPE_API_KEY", "")
-        if not self.config.base_url:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic")
-            else:
-                self.config.base_url = os.getenv("DASHSCOPE_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1")
-        if not self.config.model:
-            if self.config.llm_backend == LLMBackend.MINIMAX:
-                self.config.model = os.getenv("MINIMAX_MODEL", "MiniMax-M2.5")
-            else:
-                self.config.model = os.getenv("DASHSCOPE_MODEL", "glm-5")
+            self.config.api_key = os.getenv(env_keys[0], "")
         if not self.config.daytona_api_key:
             self.config.daytona_api_key = os.getenv("DAYTONA_API_KEY", "")
         if not self.config.tavily_api_key:
             self.config.tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+        
+        # 允许环境变量覆盖 base_url 和 model
+        env_base_url = os.getenv(env_keys[1], "")
+        if env_base_url:
+            self.config.base_url = env_base_url
+        env_model = os.getenv(env_keys[2], "")
+        if env_model:
+            self.config.model = env_model
         
         self.llm = None
         self.backend = None
@@ -160,6 +263,7 @@ class Cerebellum:
         self.scheduler = None
         self.reporter = None
         self.web_search = None
+        self.summarizer = None
         
         self._setup_logging()
     
@@ -170,19 +274,39 @@ class Cerebellum:
             logger.debug("调试模式已启用")
     
     def _create_llm(self):
-        """创建 LLM 客户端"""
+        """创建 LLM 客户端（支持 DashScope/GLM5、MiniMax、Anthropic、OpenAI）"""
         logger.debug(f"创建 LLM 客户端: backend={self.config.llm_backend.value}, model={self.config.model}")
         
-        if self.config.llm_backend == LLMBackend.MINIMAX:
-            from langchain_anthropic import ChatAnthropic
-            return ChatAnthropic(
-                model=self.config.model,
-                anthropic_api_key=self.config.api_key,
-                anthropic_api_url=self.config.base_url,
-                temperature=0.7,
-                max_tokens=4096,
-            )
+        if self.config.llm_backend in (LLMBackend.MINIMAX, LLMBackend.ANTHROPIC):
+            # MiniMax (Anthropic 兼容) 和 Anthropic 使用 ChatAnthropic
+            try:
+                from langchain_anthropic import ChatAnthropic
+            except ImportError:
+                logger.warning("langchain-anthropic 未安装，回退到 ChatOpenAI")
+                return ChatOpenAI(
+                    model=self.config.model,
+                    base_url=self.config.base_url,
+                    api_key=self.config.api_key,
+                    temperature=0.7,
+                    max_tokens=4096,
+                )
+            
+            kwargs = {
+                "model": self.config.model,
+                "anthropic_api_key": self.config.api_key,
+                "temperature": 0.7,
+                "max_tokens": 4096,
+            }
+            
+            # MiniMax 使用自定义 base_url
+            if self.config.llm_backend == LLMBackend.MINIMAX:
+                kwargs["anthropic_api_url"] = self.config.base_url
+            elif self.config.base_url and "anthropic.com" not in self.config.base_url:
+                kwargs["anthropic_api_url"] = self.config.base_url
+            
+            return ChatAnthropic(**kwargs)
         
+        # DashScope (GLM5) 和 OpenAI 使用 ChatOpenAI
         return ChatOpenAI(
             model=self.config.model,
             base_url=self.config.base_url,
@@ -198,7 +322,7 @@ class Cerebellum:
             return None, None
         
         try:
-            logger.info("正在创建沙盒环境...")
+            logger.info(SANDBOX_CREATING_MESSAGE)
             daytona_config = DaytonaConfig(
                 api_key=self.config.daytona_api_key if self.config.daytona_api_key else None
             )
@@ -313,12 +437,15 @@ class Cerebellum:
     def _extract_file_paths(self, message: str) -> List[str]:
         """从智能体回复中提取文件路径"""
         import re
+        import os.path
         file_paths = []
         
         # 匹配文件路径的正则表达式
+        ext_pattern = '|'.join(ext.lstrip('.') for ext in VALID_FILE_EXTENSIONS)
         patterns = [
-            r'/home/daytona/workspace/[\w\-\.]+\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)',  # 完整路径
-            r'\b([\w\-]+)\.(png|jpg|jpeg|pdf|xlsx|csv|txt|md)\b'  # 文件名
+            rf'/home/daytona/workspace/[\w\-\./]+\.(?:{ext_pattern})',  # 完整路径（含子目录）
+            rf'/tmp/[\w\-\./]+\.(?:{ext_pattern})',  # /tmp 目录
+            rf'\b([\w\-]+)\.({ext_pattern})\b'  # 独立文件名
         ]
         
         for pattern in patterns:
@@ -326,25 +453,32 @@ class Cerebellum:
             if matches:
                 for match in matches:
                     if isinstance(match, tuple):
-                        # 处理捕获组的情况
                         if len(match) >= 2 and match[0]:
                             filename = f"{match[0]}.{match[1]}"
                             file_paths.append(f"/home/daytona/workspace/{filename}")
                     else:
-                        # 清理路径中的特殊字符
                         cleaned_path = re.sub(r'[`"\']', '', match)
                         if cleaned_path:
                             file_paths.append(cleaned_path)
         
-        # 过滤无效路径
-        valid_extensions = {'.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.txt', '.md'}
+        # 过滤无效路径并防止路径遍历攻击
         valid_paths = []
         for path in file_paths:
-            if any(path.lower().endswith(ext) for ext in valid_extensions):
-                valid_paths.append(path)
+            if not any(path.lower().endswith(ext) for ext in VALID_FILE_EXTENSIONS):
+                continue
+            # 规范化路径并确保在安全目录内
+            normalized = os.path.normpath(path)
+            if any(normalized.startswith(prefix) for prefix in SAFE_PATH_PREFIXES):
+                valid_paths.append(normalized)
         
-        # 去重
-        return list(set(valid_paths))
+        # 去重（保持顺序）
+        seen = set()
+        result = []
+        for path in valid_paths:
+            if path not in seen:
+                seen.add(path)
+                result.append(path)
+        return result
     
     def _download_files_from_sandbox(self, specific_paths: List[str] = None) -> List[FileData]:
         """从沙盒下载文件并返回 FileData 列表"""
@@ -390,8 +524,8 @@ class Cerebellum:
                 except Exception as e:
                     logger.debug(f"find 失败: {e}")
                 
-                valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.pdf', '.xlsx', '.csv', '.txt', '.md')
-                files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+                valid_ext_tuple = tuple(VALID_FILE_EXTENSIONS)
+                files = [f for f in all_files if any(f.lower().endswith(ext) for ext in valid_ext_tuple)]
             
             if not files:
                 logger.info("未发现有效文件")
@@ -449,8 +583,21 @@ class Cerebellum:
         
         return files_data
     
+    def _apply_output_fallback(self, result: Dict[str, Any], downloaded_files: List[FileData]) -> List[FileData]:
+        """Generate corrective file when task marked success but no files are found."""
+        files = downloaded_files or []
+        if result.get("success") and not files:
+            message = result.get("message") or OUTPUT_FALLBACK_MESSAGE
+            logger.warning("任务标记成功但未找到输出文件，生成纠错文件 output.md")
+            files.append(FileData(
+                name="output.md",
+                content=message,
+                type="text"
+            ))
+        return files
+    
     def _get_file_size(self, file_path: str) -> int:
-        """获取沙盒中文件的大小"""
+        """获取沙盒中文件的大小 (Get sandbox file size)."""
         try:
             result = self.sandbox._process.exec(f"stat -c%s '{file_path}' 2>/dev/null || wc -c < '{file_path}'", timeout=10)
             if hasattr(result, 'result') and result.result:
@@ -577,6 +724,65 @@ print(base64.b64encode(data).decode('ascii'))
         except Exception as e:
             logger.warning(f"清理沙盒时出错: {e}")
     
+    def _stream_agent_events(self, prompt_messages, timeout: Optional[int] = None):
+        """
+        以超时保护的方式流式获取 agent 事件，避免工具执行长时间卡死。
+        
+        Args:
+            prompt_messages: 传递给 agent 的消息列表
+            timeout: 可选超时（秒），默认使用 sandbox.timeout_seconds 或 AGENT_STREAM_TIMEOUT
+        """
+        effective_timeout = timeout
+        if not effective_timeout:
+            if getattr(self.config, "sandbox", None) and getattr(self.config.sandbox, "timeout_seconds", None):
+                effective_timeout = self.config.sandbox.timeout_seconds
+            else:
+                effective_timeout = AGENT_STREAM_TIMEOUT
+        # 合理下限，避免 0/负值导致立即超时
+        effective_timeout = max(1, effective_timeout)
+        
+        stop_token = object()
+        queue: Queue = Queue()
+        
+        def _produce():
+            try:
+                for event in self.agent.stream(
+                    {"messages": prompt_messages, "files": self.skills_files},
+                    stream_mode="values"
+                ):
+                    queue.put(event)
+            except Exception as exc:  # 捕获异常传递给消费端
+                queue.put(exc)
+            finally:
+                queue.put(stop_token)
+        
+        producer = threading.Thread(target=_produce, daemon=True)
+        producer.start()
+        
+        deadline = time.time() + effective_timeout
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"智能体执行超时 ({effective_timeout}s)")
+                
+                try:
+                    # 使用较小的等待窗口以便及时检测 stop_token 或超时
+                    item = queue.get(timeout=min(1.0, max(0.05, remaining)))
+                except Empty:
+                    continue
+                
+                if item is stop_token:
+                    break
+                
+                if isinstance(item, Exception):
+                    raise item
+                
+                yield item
+        finally:
+            # 确保线程结束，避免资源泄漏
+            producer.join(timeout=0.1)
+    
     def _create_agent(self):
         """创建 Agent"""
         logger.debug("创建 Agent...")
@@ -695,13 +901,13 @@ else:
             logger.info(f"初始化缓存系统: {self.config.database_path}")
             self.db = DatabaseManager(self.config.database_path)
             
-            if self.config.tavily_api_key:
-                self.similarity_checker = SimilarityChecker(
-                    llm=self.llm,
-                    db=self.db,
-                    threshold=self.config.cache.similarity_threshold
-                )
-                logger.info("相似度检查器已启用")
+            # 相似度检查器始终启用（不依赖 tavily_api_key）
+            self.similarity_checker = SimilarityChecker(
+                llm=self.llm,
+                db=self.db,
+                threshold=self.config.cache.similarity_threshold
+            )
+            logger.info("相似度检查器已启用")
             
             self.cache_manager = CacheManager(
                 db=self.db,
@@ -729,6 +935,14 @@ else:
                 reflection_executor=self.reflection_executor
             )
         
+        # 初始化技能创建器
+        skills_path = self.config.skills_dir or DEFAULT_SKILLS_DIR
+        self.skill_creator = SkillCreator(llm=self.llm, skills_dir=skills_path)
+        
+        # 初始化工作流总结器
+        from .summary import WorkflowSummarizer
+        self.summarizer = WorkflowSummarizer(llm=self.llm, db=self.db)
+        
         logger.success("编排器初始化完成")
     
     def initialize(self):
@@ -746,7 +960,6 @@ else:
         self.llm = self._create_llm()
         logger.info(f"模型: {self.config.model}")
         
-        logger.info("正在创建沙盒环境...")
         self.backend, self.sandbox = self._create_sandbox()
         
         if self.sandbox:
@@ -901,6 +1114,36 @@ else:
             if available_skills:
                 logger.info(f"[任务规划器] 可用技能: {available_skills}")
                 skill_mapping = self.planner.match_skills(subtasks, available_skills)
+                
+                # 处理 skill-creator 信号：自主创建缺失的技能
+                if skill_mapping and hasattr(self, 'skill_creator'):
+                    for st_id, skill in list(skill_mapping.items()):
+                        if skill == "skill-creator":
+                            st = next((s for s in subtasks if s.id == st_id), None)
+                            if st:
+                                logger.info(f"[技能创建] 正在为 '{st.name}' 自主创建新技能...")
+                                try:
+                                    new_skill = self.skill_creator.create_skill(
+                                        name=self._sanitize_skill_name(st.name),
+                                        task_description=task,
+                                        subtask_description=st.description,
+                                    )
+                                    if new_skill and new_skill.get("content"):
+                                        new_name = new_skill["name"]
+                                        # 注入到 skills_files 供 agent 使用
+                                        skill_key = f"cerebellum/skills/{new_name}/SKILL.md"
+                                        self.skills_files[skill_key] = new_skill["content"]
+                                        # 更新映射为实际技能名
+                                        skill_mapping[st_id] = new_name
+                                        available_skills.append(new_name)
+                                        logger.success(f"[技能创建] 新技能已创建: {new_name}")
+                                    else:
+                                        logger.warning(f"[技能创建] 技能创建返回空内容: {st.name}")
+                                        del skill_mapping[st_id]
+                                except Exception as e:
+                                    logger.warning(f"[技能创建] 创建失败: {e}")
+                                    del skill_mapping[st_id]
+                
                 if skill_mapping:
                     logger.info("[任务规划器] 技能匹配结果:")
                     for st_id, skill in skill_mapping.items():
@@ -955,16 +1198,21 @@ else:
             step_count = 0
             reflection_count = 0
             max_reflections = 10
+            recursion_depth = 0
             
             def execute_with_reflection(prompt_messages, current_step=0):
-                """带反思链中断的执行函数"""
-                nonlocal agent_result, agent_error, step_count, reflection_count
+                """带反思链中断的执行函数（含致命错误检测和递归深度限制）"""
+                nonlocal agent_result, agent_error, step_count, reflection_count, recursion_depth
+                
+                # 递归深度检查：防止无限递归导致程序挂起
+                recursion_depth += 1
+                if recursion_depth > MAX_REFLECTION_RECURSION_DEPTH:
+                    logger.warning(f"[智能体] 达到最大递归深度 ({MAX_REFLECTION_RECURSION_DEPTH})，停止反思")
+                    recursion_depth -= 1
+                    return None
                 
                 try:
-                    for event in self.agent.stream(
-                        {"messages": prompt_messages, "files": self.skills_files},
-                        stream_mode="values"
-                    ):
+                    for event in self._stream_agent_events(prompt_messages):
                         if not event:
                             continue
                         
@@ -1084,6 +1332,9 @@ else:
                                                 logger.success(f"[反思链] 解决方案代码执行完成")
                                             except Exception as exec_err:
                                                 logger.warning(f"[反思链] 解决方案代码执行失败: {exec_err}")
+                                                if _is_fatal_connection_error(exec_err):
+                                                    logger.error(f"[反思链] 沙盒连接已断开，终止执行")
+                                                    return None
                                         
                                         logger.info("[反思链] 恢复任务执行...")
                                         
@@ -1111,6 +1362,11 @@ else:
                 except Exception as e:
                     agent_error = e
                     logger.error(f"[智能体] 执行错误: {type(e).__name__}: {e}")
+                    
+                    # 检测致命连接错误 — 沙盒连接已断开，不可恢复
+                    if _is_fatal_connection_error(e):
+                        logger.error(f"[智能体] 检测到致命连接错误 ({type(e).__name__})，终止执行")
+                        return None
                     
                     if self.reflection_executor and reflection_count < max_reflections:
                         reflection_count += 1
@@ -1155,6 +1411,10 @@ else:
                                     logger.success(f"[反思链] 解决方案代码执行完成")
                                 except Exception as exec_err:
                                     logger.warning(f"[反思链] 解决方案代码执行失败: {exec_err}")
+                                    # 解决方案代码执行中出现致命连接错误，终止
+                                    if _is_fatal_connection_error(exec_err):
+                                        logger.error(f"[反思链] 沙盒连接已断开，终止执行")
+                                        return None
                             
                             logger.info("[反思链] 恢复任务执行...")
                             
@@ -1174,6 +1434,8 @@ else:
                             return execute_with_reflection(new_messages, step_count)
                     
                     return None
+                finally:
+                    recursion_depth -= 1
             
             agent_result = execute_with_reflection([{"role": "user", "content": enhanced_prompt}])
             
@@ -1215,11 +1477,14 @@ else:
                     logger.debug(f"  - {path}")
             
             downloaded_files = self._download_files_from_sandbox(file_paths_from_message)
+            downloaded_files = self._apply_output_fallback(result, downloaded_files)
+            result["files"] = [
+                {"name": f.name, "content": f.content, "type": f.type}
+                for f in downloaded_files
+            ]
+            
+            # downloaded_files may still be empty for failed runs where no fallback applies; only log when something was collected
             if downloaded_files:
-                result["files"] = [
-                    {"name": f.name, "content": f.content, "type": f.type}
-                    for f in downloaded_files
-                ]
                 logger.info(f"[结果收集] 已下载 {len(downloaded_files)} 个文件")
                 
                 for f in downloaded_files:
@@ -1242,7 +1507,83 @@ else:
         result["execution_time_ms"] = execution_time_ms
         log_execution_time("任务", execution_time_ms)
         
+        # 生成工作流总结
+        if self.summarizer and result.get("reflection_chains"):
+            try:
+                summary = self.summarizer.summarize(
+                    task=task,
+                    result=result,
+                    intent=result.get("intent", ""),
+                    reflection_chains=result.get("reflection_chains", []),
+                    skills_used=result.get("skills_used", []),
+                    execution_time_ms=execution_time_ms,
+                )
+                result["summary"] = summary.to_dict()
+                logger.info(f"[总结] 生成工作流总结: {len(summary.constraints)} 个约束")
+            except Exception as e:
+                logger.debug(f"生成工作流总结失败: {e}")
+        
+        # 自学习：成功执行后，从反思链中学习并创建/强化技能
+        if result.get("success") and hasattr(self, 'skill_creator'):
+            self._learn_from_execution(task, result)
+        
         return result
+    
+    @staticmethod
+    def _sanitize_skill_name(text: str) -> str:
+        """将任意文本转为合法的技能名称（小写、连字符分隔）"""
+        import re
+        name = re.sub(r'[^\w\u4e00-\u9fff-]', '-', text[:30]).strip('-').lower()
+        if not name:
+            import hashlib
+            name = hashlib.md5(text.encode()).hexdigest()[:8]
+        return name
+    
+    def _learn_from_execution(self, task: str, result: Dict[str, Any]):
+        """
+        从成功执行中学习，自动创建或强化技能
+        
+        当任务成功完成且有反思链记录时，将解决方案提炼为新技能，
+        使 agent 在未来遇到类似任务时能直接复用。
+        """
+        reflection_chains = result.get("reflection_chains", [])
+        
+        # 仅在有反思链（即遇到过问题并成功解决）时学习
+        successful_chains = [c for c in reflection_chains if c.get("success")]
+        if not successful_chains:
+            return
+        
+        # 提炼解决方案摘要
+        solutions = []
+        for chain in successful_chains:
+            solution = chain.get("solution", "")
+            problem = chain.get("problem", "")
+            if solution and solution != NO_SOLUTION_MESSAGE:
+                solutions.append(f"问题: {problem}\n解决: {solution}")
+        
+        if not solutions:
+            return
+        
+        # 生成技能名称（基于任务关键词，使用确定性哈希）
+        skill_name = f"learned-{self._sanitize_skill_name(task)}"
+        
+        # 检查是否已存在同名技能
+        skill_key = f"cerebellum/skills/{skill_name}/SKILL.md"
+        if skill_key in self.skills_files:
+            return
+        
+        try:
+            solutions_text = "\n".join(solutions[:MAX_SOLUTIONS_TO_LEARN])
+            new_skill = self.skill_creator.create_skill(
+                name=skill_name,
+                task_description=task,
+                subtask_description=f"从反思链学习的解决方案:\n{solutions_text}",
+            )
+            if new_skill and new_skill.get("content"):
+                self.skills_files[skill_key] = new_skill["content"]
+                logger.info(f"[自学习] 从执行经验中学习并创建新技能: {skill_name}")
+        except Exception as e:
+            logger.debug(f"[自学习] 技能学习失败: {e}")
     
     def _build_file_prompt(self, task: str, files: List[tuple], result: Dict) -> str:
         """构建包含文件信息的提示"""
@@ -1315,6 +1656,7 @@ __all__ = [
     "CacheConfig",
     "ReflectionConfig",
     "SandboxConfig",
+    "LLMBackend",
     "FileData",
     "SubTask",
     "SubTaskStatus",
@@ -1332,6 +1674,8 @@ __all__ = [
     "TaskPlanner",
     "TaskScheduler",
     "TaskReporter",
+    "VALID_FILE_EXTENSIONS",
+    "extract_llm_content",
     "process_file",
     "process_files",
 ]

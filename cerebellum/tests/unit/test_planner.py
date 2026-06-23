@@ -42,10 +42,10 @@ class TestTaskPlanner:
         """测试意图分析解析错误"""
         mock_llm.invoke.return_value = MagicMock(content="invalid json")
         
-        intent, outputs = planner.analyze_intent("分析文档")
+        intent, outputs = planner.analyze_intent("做一些事情")
         
-        assert intent == "未知意图"
-        assert outputs == []
+        assert intent == "通用任务"
+        assert outputs == ["文本"]
     
     def test_analyze_intent_with_markdown(self, planner, mock_llm):
         """测试带 markdown 的响应"""
@@ -62,10 +62,10 @@ class TestTaskPlanner:
         """测试 LLM 异常"""
         mock_llm.invoke.side_effect = Exception("LLM error")
         
-        intent, outputs = planner.analyze_intent("分析文档")
+        intent, outputs = planner.analyze_intent("做一些事情")
         
-        assert intent == "未知意图"
-        assert outputs == []
+        assert intent == "通用任务"
+        assert outputs == ["文本"]
     
     def test_split_task_success(self, planner, mock_llm):
         """测试任务拆分成功"""
@@ -100,11 +100,11 @@ class TestTaskPlanner:
         """测试任务拆分解析错误时创建默认任务"""
         mock_llm.invoke.return_value = MagicMock(content="invalid json")
         
-        subtasks = planner.split_task("分析文档")
+        subtasks = planner.split_task("做一些事情")
         
         assert len(subtasks) == 1
         assert subtasks[0].name == "执行任务"
-        assert subtasks[0].description == "分析文档"
+        assert subtasks[0].description == "做一些事情"
     
     def test_split_task_exception(self, planner, mock_llm):
         """测试 LLM 异常时创建默认任务"""
@@ -159,7 +159,7 @@ class TestTaskPlanner:
         assert mapping["st1"] == "skill-creator"
     
     def test_match_skills_exception(self, planner, mock_llm):
-        """测试技能匹配异常"""
+        """测试技能匹配异常时回退到 skill-creator"""
         subtasks = [
             SubTask(id="st1", name="任务", description="描述")
         ]
@@ -168,10 +168,11 @@ class TestTaskPlanner:
         
         mapping = planner.match_skills(subtasks, ["skill1"])
         
-        assert "st1" not in mapping
+        # 关键词匹配无法找到时，返回 skill-creator
+        assert mapping.get("st1") == "skill-creator"
     
     def test_match_skills_invalid_skill(self, planner, mock_llm):
-        """测试返回无效技能名称"""
+        """测试返回无效技能名称时回退到 skill-creator"""
         subtasks = [
             SubTask(id="st1", name="任务", description="描述")
         ]
@@ -180,4 +181,38 @@ class TestTaskPlanner:
         
         mapping = planner.match_skills(subtasks, ["skill1", "skill2"])
         
-        assert "st1" not in mapping
+        # LLM 返回无效技能名 -> 关键词匹配 -> 无匹配 -> skill-creator
+        assert mapping.get("st1") == "skill-creator"
+    
+    def test_keyword_fallback_returns_skill_creator(self):
+        """测试关键词匹配无结果时返回 skill-creator"""
+        planner = TaskPlanner(llm=None)
+        
+        subtask = SubTask(id="st1", name="特殊操作", description="执行一些不常见的操作")
+        result = planner._match_skill_by_keywords(subtask, ["pdf", "xlsx"])
+        
+        assert result == "skill-creator"
+    
+    def test_keyword_fallback_returns_matched_skill(self):
+        """测试关键词匹配找到技能时返回正确技能"""
+        planner = TaskPlanner(llm=None)
+        
+        subtask = SubTask(id="st1", name="创建 PDF 报告", description="生成 PDF 格式的报告")
+        result = planner._match_skill_by_keywords(subtask, ["pdf", "xlsx", "chart"])
+        
+        # "报告" 匹配 pdf 技能关键词
+        assert result == "pdf"
+    
+    def test_match_skills_all_skill_creator_no_llm(self):
+        """测试无 LLM 且无关键词匹配时，所有子任务都返回 skill-creator"""
+        planner = TaskPlanner(llm=None)
+        
+        subtasks = [
+            SubTask(id="st1", name="自定义任务1", description="执行自定义操作"),
+            SubTask(id="st2", name="自定义任务2", description="另一个操作"),
+        ]
+        
+        mapping = planner.match_skills(subtasks, ["pdf", "docx"])
+        
+        assert mapping.get("st1") == "skill-creator"
+        assert mapping.get("st2") == "skill-creator"

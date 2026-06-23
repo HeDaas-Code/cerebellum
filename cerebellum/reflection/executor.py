@@ -8,6 +8,7 @@ import json
 import uuid
 from typing import Dict, Any, Optional, List
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from langchain_openai import ChatOpenAI
 
@@ -15,6 +16,9 @@ from .chain import ReflectionChain, ReflectionHistory
 from ..types import ReflectionStatus
 from ..tools.sandbox import SandboxManager
 from ..utils import logger
+
+# LLM 调用超时（秒）
+LLM_CALL_TIMEOUT = 60
 
 
 class ReflectionChainExecutor:
@@ -43,18 +47,24 @@ class ReflectionChainExecutor:
         self.web_search = web_search
         logger.debug("反思链执行器初始化完成")
     
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, timeout: int = LLM_CALL_TIMEOUT) -> str:
         """
-        统一调用 LLM，兼容不同后端
+        统一调用 LLM，兼容不同后端（含超时保护）
         
         Args:
             prompt: 提示词
+            timeout: 超时时间（秒），默认 60s
         
         Returns:
             LLM 响应内容
         """
+        def _invoke():
+            return self.llm.invoke(prompt)
+        
         try:
-            response = self.llm.invoke(prompt)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_invoke)
+                response = future.result(timeout=timeout)
             
             if hasattr(response, 'content'):
                 content = response.content
@@ -77,6 +87,9 @@ class ReflectionChainExecutor:
                 return str(content)
             
             return str(response)
+        except FuturesTimeoutError:
+            logger.error(f"[反思链] LLM 调用超时 ({timeout}s)")
+            raise TimeoutError(f"LLM 调用超时 ({timeout}s)")
         except Exception as e:
             logger.error(f"[反思链] LLM 调用失败: {e}")
             raise
@@ -496,6 +509,25 @@ class ReflectionChainExecutor:
             return json.loads(content)
         except Exception:
             return [problem]
+    
+    def _build_solution(
+        self,
+        chain: ReflectionChain,
+        context: Dict[str, Any],
+        previous_chains: list = None
+    ) -> tuple:
+        """
+        构建解决方案（_build_solution_with_search 的别名）
+        
+        Args:
+            chain: 反思链
+            context: 上下文
+            previous_chains: 之前的反思链记录
+        
+        Returns:
+            (root_cause, solution, code)
+        """
+        return self._build_solution_with_search(chain, context, previous_chains)
     
     def _build_solution_with_search(
         self, 

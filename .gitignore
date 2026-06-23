@@ -1,3 +1,8 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
 # 测试覆盖率
 htmlcov/
 .coverage

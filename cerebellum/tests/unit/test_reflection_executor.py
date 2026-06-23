@@ -7,8 +7,9 @@ reflection/executor.py 单元测试
 import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
-from cerebellum.reflection.executor import ReflectionChainExecutor
+from cerebellum.reflection.executor import ReflectionChainExecutor, LLM_CALL_TIMEOUT
 from cerebellum.types import ReflectionStatus, ExecuteResult
 from cerebellum.tools.sandbox import SandboxManager
 
@@ -260,3 +261,96 @@ class TestReflectionChainExecutor:
         chain = executor.execute_chain("Error", {}, 1)
         
         assert chain.search_results == []
+
+    def test_call_llm_timeout(self, executor, mock_llm):
+        """测试 LLM 调用超时保护"""
+        import time
+        def slow_invoke(prompt):
+            time.sleep(10)
+            return MagicMock(content="response")
+        mock_llm.invoke.side_effect = slow_invoke
+        
+        with pytest.raises(TimeoutError, match="LLM 调用超时"):
+            executor._call_llm("test prompt", timeout=1)
+
+    def test_call_llm_respects_timeout_param(self, executor, mock_llm):
+        """测试 LLM 调用超时参数传递"""
+        mock_llm.invoke.return_value = MagicMock(content="快速响应")
+        
+        result = executor._call_llm("test prompt", timeout=5)
+        assert result == "快速响应"
+
+    def test_call_llm_default_timeout(self, executor, mock_llm):
+        """测试 LLM 调用默认超时值存在"""
+        assert LLM_CALL_TIMEOUT == 60
+
+
+class TestFatalConnectionErrorDetection:
+    """致命连接错误检测测试"""
+    
+    def test_remote_disconnected_is_fatal(self):
+        """测试 RemoteDisconnected 被识别为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        from http.client import RemoteDisconnected
+        
+        error = RemoteDisconnected("Remote end closed connection without response")
+        assert _is_fatal_connection_error(error) is True
+    
+    def test_connection_reset_is_fatal(self):
+        """测试 ConnectionResetError 被识别为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = ConnectionResetError("Connection reset by peer")
+        assert _is_fatal_connection_error(error) is True
+    
+    def test_connection_refused_is_fatal(self):
+        """测试 ConnectionRefusedError 被识别为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = ConnectionRefusedError("Connection refused")
+        assert _is_fatal_connection_error(error) is True
+    
+    def test_broken_pipe_is_fatal(self):
+        """测试 BrokenPipeError 被识别为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = BrokenPipeError("Broken pipe")
+        assert _is_fatal_connection_error(error) is True
+    
+    def test_normal_error_is_not_fatal(self):
+        """测试普通错误不被误判为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = ValueError("some value error")
+        assert _is_fatal_connection_error(error) is False
+    
+    def test_not_found_error_is_not_fatal(self):
+        """测试 NotFoundError(404) 不被误判为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = Exception("Error code: 404")
+        assert _is_fatal_connection_error(error) is False
+    
+    def test_nested_remote_disconnected_is_fatal(self):
+        """测试嵌套的 RemoteDisconnected 也被识别为致命错误"""
+        from cerebellum import _is_fatal_connection_error
+        from http.client import RemoteDisconnected
+        
+        inner = RemoteDisconnected("Remote end closed connection")
+        outer = Exception("Retrying after connection broken")
+        outer.__cause__ = inner
+        
+        assert _is_fatal_connection_error(outer) is True
+    
+    def test_error_message_with_remote_disconnected_is_fatal(self):
+        """测试错误消息包含 RemoteDisconnected 的情况"""
+        from cerebellum import _is_fatal_connection_error
+        
+        error = Exception("RemoteDisconnected('Remote end closed connection without response')")
+        assert _is_fatal_connection_error(error) is True
+
+    def test_max_reflection_recursion_depth_constant(self):
+        """测试最大递归深度常量存在"""
+        from cerebellum import MAX_REFLECTION_RECURSION_DEPTH
+        assert MAX_REFLECTION_RECURSION_DEPTH >= 1
+        assert MAX_REFLECTION_RECURSION_DEPTH <= 10

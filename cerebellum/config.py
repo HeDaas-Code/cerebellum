@@ -70,16 +70,35 @@ class CerebellumConfig:
     
     database_path: Optional[Path] = None
     
+    # 各后端的默认配置 (base_url, model)
+    BACKEND_DEFAULTS = {
+        LLMBackend.DASHSCOPE: ("https://coding.dashscope.aliyuncs.com/v1", "glm-5"),
+        LLMBackend.MINIMAX: ("https://api.minimaxi.com/anthropic", "MiniMax-M2.5"),
+        LLMBackend.ANTHROPIC: ("https://api.anthropic.com", "claude-sonnet-4-20250514"),
+        LLMBackend.OPENAI: ("https://api.openai.com/v1", "gpt-4o"),
+    }
+    
     def __post_init__(self):
         if self.database_path is None:
             self.database_path = Path.home() / ".cerebellum" / "cache.db"
         
-        if self.llm_backend == LLMBackend.MINIMAX:
-            self.base_url = "https://api.minimaxi.com/anthropic"
-            self.model = "MiniMax-M2.5"
-        elif self.llm_backend == LLMBackend.ANTHROPIC:
-            self.base_url = "https://api.anthropic.com"
-            self.model = "claude-sonnet-4-20250514"
-        elif self.llm_backend == LLMBackend.OPENAI:
-            self.base_url = "https://api.openai.com/v1"
-            self.model = "gpt-4o"
+        self.apply_backend_defaults()
+    
+    def apply_backend_defaults(self):
+        """根据当前 llm_backend 应用默认的 base_url 和 model
+        
+        仅当 base_url/model 仍为其他后端的默认值时才覆盖，
+        避免覆盖用户显式设置的自定义值。
+        """
+        # 收集所有后端的默认 base_url 和 model
+        all_default_urls = {v[0] for v in self.BACKEND_DEFAULTS.values()}
+        all_default_models = {v[1] for v in self.BACKEND_DEFAULTS.values()}
+        
+        defaults = self.BACKEND_DEFAULTS.get(self.llm_backend)
+        if defaults:
+            # 仅当 base_url 还是某个后端的默认值（或空）时才更新
+            if not self.base_url or self.base_url in all_default_urls:
+                self.base_url = defaults[0]
+            # 仅当 model 还是某个后端的默认值（或空）时才更新
+            if not self.model or self.model in all_default_models:
+                self.model = defaults[1]
